@@ -52,11 +52,13 @@ Transcription fits in output budget for any audio under the 60 min cap.
 - [x] Functional: list via stdin, missing file exits 1, unknown action exits 1
 - 34 tests, all passing
 
-## M3 — Static fixture files
+## M3 — Static fixture files ✅
 
-- [ ] Generate small audio fixture with ffmpeg (`tests/fixtures/sample.ogg`, 2s silence + tone)
-- [ ] `create_fixtures.sh` script to regenerate
-- [ ] Use fixture in info/list tests (real ffprobe, no mock)
+- [x] `tests/fixtures/sample.ogg` — 2s 440 Hz tone (10 KB, Opus codec)
+- [x] `tests/create_fixtures.sh` to regenerate
+- [x] `TestFixtureIntegration` — info + list with real ffprobe on fixture
+- [x] `test_real_ffprobe_on_fixture` — duration detection on real audio
+- 37 tests total, all passing
 
 ## M4 — Integration with kiso registry
 

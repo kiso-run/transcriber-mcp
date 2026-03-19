@@ -285,6 +285,9 @@ class TestFormatSize:
         assert "MB" in _format_size(5 * 1024 * 1024)
 
 
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
 class TestGetDuration:
     def test_ffprobe_success(self, workspace, ogg_file):
         ffprobe_output = json.dumps({"format": {"duration": "12.345"}})
@@ -303,6 +306,42 @@ class TestGetDuration:
         with patch("subprocess.run", side_effect=FileNotFoundError):
             result = _get_duration(ogg_file)
         assert result is None
+
+    def test_real_ffprobe_on_fixture(self):
+        """Real ffprobe on the static OGG fixture — no mocks."""
+        fixture = FIXTURES / "sample.ogg"
+        if not fixture.exists():
+            pytest.skip("fixture not found — run tests/create_fixtures.sh")
+        duration = _get_duration(fixture)
+        assert duration is not None
+        assert 1.5 < duration < 3.0  # 2-second tone
+
+
+class TestFixtureIntegration:
+    """Tests using the real audio fixture with real ffprobe."""
+
+    @pytest.fixture
+    def fixture_workspace(self, tmp_path):
+        """Workspace with the static OGG fixture copied to uploads/."""
+        import shutil
+        fixture = FIXTURES / "sample.ogg"
+        if not fixture.exists():
+            pytest.skip("fixture not found — run tests/create_fixtures.sh")
+        uploads = tmp_path / "uploads"
+        uploads.mkdir()
+        shutil.copy2(fixture, uploads / "sample.ogg")
+        return tmp_path
+
+    def test_info_real_ffprobe(self, fixture_workspace):
+        result = do_info(str(fixture_workspace), {"file_path": "uploads/sample.ogg"})
+        assert "sample.ogg" in result
+        assert "Duration:" in result
+        assert "2s" in result
+
+    def test_list_real_ffprobe(self, fixture_workspace):
+        result = do_list(str(fixture_workspace))
+        assert "sample.ogg" in result
+        assert "2s" in result
 
 
 # ---------------------------------------------------------------------------
