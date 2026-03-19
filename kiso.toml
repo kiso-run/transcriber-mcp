@@ -1,0 +1,35 @@
+[kiso]
+type = "tool"
+name = "transcriber"
+version = "0.1.0"
+description = "Transcribe audio files (voice messages, recordings) to text via Whisper API"
+
+[kiso.tool]
+summary = "Transcribe audio files to text — voice messages, recordings, podcasts"
+usage_guide = """\
+Use this tool to transcribe audio files to text. Supports all common audio formats \
+(OGG, MP3, M4A, WAV, WEBM, FLAC). Audio files are typically found in the uploads/ \
+directory (placed there by connectors when users send voice messages).
+
+Actions:
+  transcribe — convert audio to text (default). Returns the transcription.
+  info       — show audio file metadata (format, duration, size) without transcribing.
+  list       — list audio files in uploads/ directory.
+
+For long audio files (>10 min), the tool automatically segments the audio and \
+transcribes each segment, returning a combined result with timestamps.
+
+The file_path arg is relative to the session workspace (e.g. "uploads/voice-message.ogg")."""
+
+[kiso.tool.args]
+action    = { type = "string", required = false, description = "one of: transcribe (default), info, list" }
+file_path = { type = "string", required = false, description = "path to audio file, relative to workspace" }
+language  = { type = "string", required = false, description = "ISO 639-1 language hint (e.g. 'en', 'it') — improves accuracy" }
+
+[kiso.tool.env]
+# Uses the same LLM API key as kiso (OpenRouter). No extra key needed.
+# Override with KISO_TOOL_TRANSCRIBER_API_KEY if using a different provider.
+
+[kiso.deps]
+python = ">=3.11"
+bin = ["ffprobe"]
