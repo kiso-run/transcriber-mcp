@@ -100,8 +100,8 @@ Output budget: 50K chars ≈ ~66 min of speech. Always fits within cap.
 - [x] 39 tests, all passing
 
 ### Validation
-- [ ] `uv run pytest tests/ -q` passes
-- [ ] Manual test: transcribe `/home/ymx1zq/Downloads/example.mp3` ("questa è una prova") → correct Italian text
+- [x] `uv run pytest tests/ -q` passes — 44 tests
+- [ ] Manual test: transcribe `/home/ymx1zq/Downloads/example.mp3` (needs VPS with OpenRouter API)
 
 ## M6 — Security + robustness fixes (code review) ✅
 
@@ -123,10 +123,10 @@ Output budget: 50K chars ≈ ~66 min of speech. Always fits within cap.
 **Tests to add:**
 - [x] Path traversal lateral escape
 - [x] Malformed JSON stdin
-- [ ] Empty choices array from API
-- [ ] Malformed API response (missing message/content keys)
-- [ ] Whitespace-only transcription
-- [x] `uv run pytest tests/ -q` passes — 41 tests
+- [x] Empty choices array from API → RuntimeError
+- [x] Malformed API response (missing message/content keys) → "No speech detected"
+- [x] Whitespace-only transcription → "No speech detected"
+- [x] `uv run pytest tests/ -q` passes — 44 tests
 
 ## Known Issues
 

@@ -202,6 +202,45 @@ class TestDoTranscribe:
         with pytest.raises(ValueError, match="file_path"):
             do_transcribe(str(workspace), {})
 
+    def test_transcribe_empty_choices(self, workspace, ogg_file):
+        """Empty choices array from API → RuntimeError, not 'no speech'."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"choices": []}
+        with (
+            patch("run._get_duration", return_value=5.0),
+            patch("run._get_api_key", return_value="sk-test"),
+            patch("run._compress_audio", return_value=ogg_file),
+            patch("httpx.post", return_value=mock_response),
+        ):
+            with pytest.raises(RuntimeError, match="no output"):
+                do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
+
+    def test_transcribe_malformed_response(self, workspace, ogg_file):
+        """API returns choices with missing message/content keys → empty text → 'No speech'."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"choices": [{}]}
+        with (
+            patch("run._get_duration", return_value=5.0),
+            patch("run._get_api_key", return_value="sk-test"),
+            patch("run._compress_audio", return_value=ogg_file),
+            patch("httpx.post", return_value=mock_response),
+        ):
+            result = do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
+        assert "No speech detected" in result
+
+    def test_transcribe_whitespace_only(self, workspace, ogg_file):
+        """Whitespace-only transcription treated as no speech."""
+        with (
+            patch("run._get_duration", return_value=5.0),
+            patch("run._get_api_key", return_value="sk-test"),
+            patch("run._compress_audio", return_value=ogg_file),
+            patch("httpx.post", return_value=_mock_gemini_response("   \n\n   ")),
+        ):
+            result = do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
+        assert "No speech detected" in result
+
 
 # ---------------------------------------------------------------------------
 # Compression
