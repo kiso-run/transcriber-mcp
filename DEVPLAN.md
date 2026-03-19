@@ -103,6 +103,31 @@ Output budget: 50K chars ≈ ~66 min of speech. Always fits within cap.
 - [ ] `uv run pytest tests/ -q` passes
 - [ ] Manual test: transcribe `/home/ymx1zq/Downloads/example.mp3` ("questa è una prova") → correct Italian text
 
+## M6 — Security + robustness fixes (code review)
+
+**Path traversal prefix attack (CRITICAL):**
+- [ ] `run.py:_resolve_path()` — replace `str(resolved).startswith(str(ws_resolved))` with `resolved.relative_to(ws_resolved)`
+
+**JSON input safety:**
+- [ ] Wrap `json.load(sys.stdin)` in try-except JSONDecodeError — print clean error + exit 1
+
+**MIME type when compression fails:**
+- [ ] `_call_gemini_transcribe()` hardcodes `mime_type = "audio/ogg"` — if ffmpeg fails and original file is MP3/WAV, wrong MIME type is sent. Detect actual format from file extension.
+
+**Empty API response handling:**
+- [ ] `_call_gemini_transcribe()` — if `choices` is empty list, raise RuntimeError instead of returning empty string (distinguishes API failure from silence)
+
+**Reduce max_tokens:**
+- [ ] Change `max_tokens=4096` to `max_tokens=512` — voice messages rarely exceed 100 words
+
+**Tests to add:**
+- [ ] Path traversal lateral escape
+- [ ] Malformed JSON stdin
+- [ ] Empty choices array from API
+- [ ] Malformed API response (missing message/content keys)
+- [ ] Whitespace-only transcription
+- [ ] `uv run pytest tests/ -q` passes
+
 ## Known Issues
 
 - Gemini audio input: no speaker diarization (who said what) — returns flat text
