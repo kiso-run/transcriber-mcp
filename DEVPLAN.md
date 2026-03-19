@@ -60,8 +60,9 @@ Transcription fits in output budget for any audio under the 60 min cap.
 - [x] `test_real_ffprobe_on_fixture` — duration detection on real audio
 - 37 tests total, all passing
 
-## M4 — Integration with kiso registry
+## M4 — Integration with kiso registry (pending — needs VPS)
 
+- [x] transcriber added to core registry.json
 - [ ] Verify `kiso tool install transcriber` works end-to-end (needs Docker + VPS)
 - [ ] Live test: send voice message via Discord → transcription appears in response
 
