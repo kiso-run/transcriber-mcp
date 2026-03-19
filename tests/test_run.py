@@ -379,6 +379,9 @@ class TestGetDuration:
         fixture = FIXTURES / "sample.ogg"
         if not fixture.exists():
             pytest.skip("fixture not found")
+        import shutil
+        if not shutil.which("ffprobe"):
+            pytest.skip("ffprobe not installed")
         duration = _get_duration(fixture)
         assert duration is not None
         assert 1.5 < duration < 3.0
@@ -391,6 +394,8 @@ class TestFixtureIntegration:
         fixture = FIXTURES / "sample.ogg"
         if not fixture.exists():
             pytest.skip("fixture not found")
+        if not shutil.which("ffprobe"):
+            pytest.skip("ffprobe not installed")
         uploads = tmp_path / "uploads"
         uploads.mkdir()
         shutil.copy2(fixture, uploads / "sample.ogg")
