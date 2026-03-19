@@ -1,4 +1,4 @@
-"""tool-transcriber — transcribe audio files to text via Whisper API.
+"""tool-transcriber — transcribe audio files to text via Gemini multimodal.
 
 Subprocess contract (same as all kiso tools):
   stdin:  JSON {args, session, workspace, session_secrets, plan_outputs}
@@ -6,39 +6,38 @@ Subprocess contract (same as all kiso tools):
   stderr: error description on failure
   exit 0: success, exit 1: failure
 
-Token budget strategy:
-  Whisper charges per-minute of audio. To avoid surprise costs:
-  - Short audio (<10 min): transcribe in one shot
-  - Long audio (>=10 min): segment into chunks, transcribe each, combine
-  - Very long audio (>60 min): transcribe first 60 min, return partial
-    result with duration info so the planner can decide whether to continue
+Uses Gemini 2.5 Flash Lite via OpenRouter /chat/completions.
+Audio is compressed to OGG Opus 32kbps mono 16kHz, then sent as base64.
+Same API key as all kiso LLM calls — zero extra config.
 
-  Output budget: same as docreader (_MAX_OUTPUT_CHARS = 50K).
-  Typical speech = ~150 words/min = ~750 chars/min.
-  50K chars ≈ ~66 min of speech — fits comfortably.
+Cost: 32 tokens/sec of audio. 5 min = 9600 tokens = $0.0014.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
 _MAX_OUTPUT_CHARS = 50_000
-_MAX_DURATION_SECS = 3600  # 60 min — hard cap to limit API costs
-_SEGMENT_DURATION_SECS = 600  # 10 min — segment threshold
+_MAX_DURATION_SECS = 300  # 5 min — hard cap
+_COMPRESS_THRESHOLD = 500 * 1024  # 500 KB — skip compression if already small
 
 _AUDIO_EXTENSIONS = frozenset({
     ".ogg", ".mp3", ".m4a", ".wav", ".webm", ".flac",
-    ".opus", ".aac", ".wma", ".mp4",  # mp4 with audio track
+    ".opus", ".aac", ".wma", ".mp4",
 })
 
-# Whisper API max file size is 25 MB
-_MAX_FILE_SIZE = 25 * 1024 * 1024
+_SYSTEM_PROMPT = (
+    "Transcribe the audio exactly as spoken. "
+    "Return only the transcription text, no commentary, timestamps, or formatting."
+)
 
 
 def main() -> None:
@@ -106,39 +105,41 @@ def do_info(workspace: str, args: dict) -> str:
     ]
     if duration is not None:
         lines.append(f"Duration: {_format_duration(duration)}")
-        est_chars = int(duration / 60 * 750)  # ~150 words/min ≈ 750 chars/min
+        est_chars = int(duration / 60 * 750)
         lines.append(f"Estimated transcript: ~{est_chars} chars")
     return "\n".join(lines)
 
 
 def do_transcribe(workspace: str, args: dict) -> str:
-    """Transcribe an audio file to text via Whisper API."""
+    """Transcribe an audio file to text via Gemini multimodal."""
     file_path = _resolve_path(workspace, args)
     language = args.get("language")
-    size = file_path.stat().st_size
     duration = _get_duration(file_path)
 
-    if size > _MAX_FILE_SIZE:
+    # Duration guard
+    if duration is not None and duration > _MAX_DURATION_SECS:
         return (
-            f"File too large ({_format_size(size)}). "
-            f"Whisper API limit is {_format_size(_MAX_FILE_SIZE)}. "
-            f"Use ffmpeg to compress or split the file first."
+            f"Audio too long ({_format_duration(duration)}). "
+            f"Max duration is {_format_duration(_MAX_DURATION_SECS)}. "
+            f"Split the file first (e.g. ffmpeg -t 300 -i input.ogg output.ogg)."
         )
 
     header = f"Transcription: {file_path.name}"
     if duration is not None:
         header += f" ({_format_duration(duration)})"
 
-    # Cost guard: cap at 60 min
-    if duration is not None and duration > _MAX_DURATION_SECS:
-        header += (
-            f"\nNote: Audio is {_format_duration(duration)} — "
-            f"transcribing first {_format_duration(_MAX_DURATION_SECS)} only. "
-            f"Use language hint for better accuracy on long audio."
-        )
+    # Compress if needed, then transcribe
+    compressed = _compress_audio(file_path)
+    try:
+        api_key = _get_api_key()
+        text = _call_gemini_transcribe(compressed, api_key, language)
+    finally:
+        # Clean up temp file if we created one
+        if compressed != file_path and compressed.exists():
+            compressed.unlink()
 
-    api_key = _get_api_key()
-    text = _call_whisper_api(file_path, api_key, language)
+    if not text.strip():
+        return f"{header}\nNo speech detected in audio."
 
     if len(text) > _MAX_OUTPUT_CHARS:
         shown = text[:_MAX_OUTPUT_CHARS]
@@ -147,65 +148,128 @@ def do_transcribe(workspace: str, args: dict) -> str:
             shown = shown[:last_nl]
         text = (
             f"{shown}\n\n"
-            f"Showing first {len(shown)} of {len(text)} chars. "
-            f"Full transcript saved as text in the task output."
+            f"Showing first {len(shown)} of {len(text)} chars."
         )
 
     return f"{header}\n\n{text}"
 
 
 # ---------------------------------------------------------------------------
-# Whisper API
+# Audio compression
+# ---------------------------------------------------------------------------
+
+
+def _compress_audio(path: Path) -> Path:
+    """Compress audio to OGG Opus mono 16kHz 32kbps for efficient API transfer.
+
+    Skips compression if file is already small and in OGG format.
+    Returns the path to use (original or temp file).
+    """
+    if path.stat().st_size <= _COMPRESS_THRESHOLD and path.suffix.lower() in (".ogg", ".opus"):
+        return path
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+    tmp.close()
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-i", str(path),
+                "-ac", "1",        # mono
+                "-ar", "16000",    # 16kHz
+                "-b:a", "32k",     # 32kbps
+                "-f", "ogg",
+                "-y", tmp.name,
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            # Compression failed — use original
+            Path(tmp.name).unlink(missing_ok=True)
+            return path
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        Path(tmp.name).unlink(missing_ok=True)
+        return path
+
+    return Path(tmp.name)
+
+
+# ---------------------------------------------------------------------------
+# Gemini API
 # ---------------------------------------------------------------------------
 
 
 def _get_api_key() -> str:
-    """Get API key — prefer tool-specific, fall back to kiso LLM key."""
-    key = os.environ.get("KISO_TOOL_TRANSCRIBER_API_KEY")
-    if key:
-        return key
+    """Get API key — same as kiso LLM key."""
     key = os.environ.get("KISO_LLM_API_KEY")
     if key:
         return key
     raise RuntimeError(
-        "No API key found. Set KISO_TOOL_TRANSCRIBER_API_KEY or KISO_LLM_API_KEY."
+        "No API key found. Set KISO_LLM_API_KEY (same key used by kiso for all LLM calls)."
     )
 
 
-def _call_whisper_api(
+def _call_gemini_transcribe(
     file_path: Path, api_key: str, language: str | None = None,
 ) -> str:
-    """Call OpenRouter/OpenAI Whisper API for transcription."""
+    """Send audio to Gemini via OpenRouter chat completion."""
     import httpx
 
-    # OpenRouter proxies OpenAI's audio endpoint
     base_url = os.environ.get(
         "KISO_TOOL_TRANSCRIBER_BASE_URL",
-        "https://api.openai.com/v1",
+        "https://openrouter.ai/api/v1",
     )
-    url = f"{base_url}/audio/transcriptions"
+    url = f"{base_url}/chat/completions"
 
-    with open(file_path, "rb") as f:
-        files = {"file": (file_path.name, f, "audio/mpeg")}
-        data: dict[str, str] = {"model": "whisper-1"}
-        if language:
-            data["language"] = language
+    audio_data = base64.b64encode(file_path.read_bytes()).decode()
+    mime_type = "audio/ogg"  # always OGG after compression
 
-        response = httpx.post(
-            url,
-            headers={"Authorization": f"Bearer {api_key}"},
-            files=files,
-            data=data,
-            timeout=300,  # 5 min — long audio can take a while
-        )
+    prompt = _SYSTEM_PROMPT
+    if language:
+        prompt += f" The audio is in {language}."
+
+    payload = {
+        "model": "google/gemini-2.5-flash-lite",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": audio_data,
+                            "format": "ogg",
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            },
+        ],
+        "max_tokens": 4096,
+    }
+
+    response = httpx.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=120,
+    )
 
     if response.status_code != 200:
         raise RuntimeError(
-            f"Whisper API error ({response.status_code}): {response.text[:500]}"
+            f"Gemini API error ({response.status_code}): {response.text[:500]}"
         )
 
     result = response.json()
-    return result.get("text", "")
+    choices = result.get("choices", [])
+    if not choices:
+        return ""
+    return choices[0].get("message", {}).get("content", "")
 
 
 # ---------------------------------------------------------------------------

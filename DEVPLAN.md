@@ -69,41 +69,35 @@ Output budget: 50K chars ≈ ~66 min of speech. Always fits within cap.
 - [ ] Verify `kiso tool install transcriber` works end-to-end (needs Docker + VPS)
 - [ ] Live test: send voice message via Discord → transcription appears in response
 
-## M5 — Rewrite: Whisper API → Gemini multimodal via OpenRouter
+## M5 — Rewrite: Whisper API → Gemini multimodal via OpenRouter ✅
 
-**Problem:** Whisper API is OpenAI-only — doesn't go through OpenRouter. Requires separate API key + config. Breaks kiso's "single provider" model.
-
-**Solution:** Use Gemini 2.5 Flash's audio input capability via OpenRouter's standard `/chat/completions`. Send audio as base64 inline content, get text back. Same API key, same provider, 20x cheaper.
+**Problem:** Whisper API is OpenAI-only — doesn't go through OpenRouter.
+**Solution:** Gemini 2.5 Flash Lite via OpenRouter `/chat/completions`. 20x cheaper.
 
 ### Audio compression pipeline
-- [ ] `_compress_audio(path) -> Path` — ffmpeg converts any input format to OGG Opus mono 16kHz 32kbps into a temp file
-- [ ] Skip compression if file is already small enough (<500 KB) and in a supported format
-- [ ] Temp file cleanup after API call
+- [x] `_compress_audio(path)` — ffmpeg → OGG Opus mono 16kHz 32kbps
+- [x] Skip compression for small OGG files (<500 KB)
+- [x] Temp file cleanup in finally block
 
 ### API rewrite
-- [ ] Replace `_call_whisper_api()` with `_call_gemini_transcribe(file_path, api_key, language)`
-- [ ] Read compressed audio → base64 encode → build chat message with audio content part
-- [ ] Model: `google/gemini-2.5-flash-lite` (cheapest, audio-capable)
-- [ ] System prompt: "Transcribe the audio exactly. Return only the transcription text, no commentary."
-- [ ] Language hint: if provided, add to system prompt ("The audio is in {language}.")
-- [ ] Base URL: OpenRouter default (`https://openrouter.ai/api/v1`), configurable via `KISO_TOOL_TRANSCRIBER_BASE_URL`
+- [x] `_call_gemini_transcribe()` — base64 audio → chat completion with `input_audio` content part
+- [x] Model: `google/gemini-2.5-flash-lite`
+- [x] Language hint appended to system prompt
+- [x] Base URL: OpenRouter default, configurable
 
 ### Cost guard update
-- [ ] Hard cap: 5 min (was 60 min) — Gemini handles it fine but keeps costs predictable
-- [ ] File size check after compression (not before) — reject if compressed >5 MB
-- [ ] Duration check via ffprobe: reject >5 min with message suggesting to split the file
+- [x] Hard cap: 5 min (was 60 min) — duration check rejects with split suggestion
+- [x] No file size check needed — compression keeps everything small
 
 ### Config simplification
-- [ ] API key: `KISO_LLM_API_KEY` only (remove `KISO_TOOL_TRANSCRIBER_API_KEY` fallback — no separate key needed)
-- [ ] Remove `[kiso.tool.env]` section from kiso.toml (no tool-specific env vars)
-- [ ] Update README: no OpenAI key needed, uses kiso's existing OpenRouter key
+- [x] API key: `KISO_LLM_API_KEY` only (removed `KISO_TOOL_TRANSCRIBER_API_KEY`)
+- [x] Removed `[kiso.tool.env]` from kiso.toml
+- [x] Updated README + kiso.toml description + version → 0.2.0
 
-### Tests update
-- [ ] Update mocked API response format (chat completion response, not Whisper response)
-- [ ] Add test for compression pipeline (mock ffmpeg subprocess)
-- [ ] Add test: skip compression for small OGG files
-- [ ] Update functional tests
-- [ ] All existing test scenarios still covered (truncation, file size, duration cap, etc.)
+### Tests
+- [x] All mocked responses updated to chat completion format
+- [x] Compression tests: skip small OGG, compress large, compress non-OGG, ffmpeg failure fallback
+- [x] 39 tests, all passing
 
 ### Validation
 - [ ] `uv run pytest tests/ -q` passes

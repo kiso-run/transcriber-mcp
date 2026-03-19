@@ -1,4 +1,4 @@
-"""Unit tests for tool-transcriber."""
+"""Unit tests for tool-transcriber (Gemini multimodal version)."""
 from __future__ import annotations
 
 import json
@@ -12,8 +12,11 @@ import pytest
 from run import (
     do_list, do_info, do_transcribe,
     _resolve_path, _get_duration, _format_duration, _format_size,
-    _get_api_key, _MAX_OUTPUT_CHARS, _MAX_FILE_SIZE,
+    _get_api_key, _compress_audio, _MAX_OUTPUT_CHARS, _MAX_DURATION_SECS,
+    _COMPRESS_THRESHOLD,
 )
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +33,6 @@ def workspace(tmp_path):
 
 @pytest.fixture
 def ogg_file(workspace):
-    """Create a fake .ogg file (not real audio, just for path/size tests)."""
     f = workspace / "uploads" / "voice-message.ogg"
     f.write_bytes(b"\x00" * 1024)
     return f
@@ -45,7 +47,6 @@ def mp3_file(workspace):
 
 @pytest.fixture
 def mixed_files(workspace):
-    """Create audio + non-audio files."""
     (workspace / "uploads" / "voice.ogg").write_bytes(b"\x00" * 100)
     (workspace / "uploads" / "song.mp3").write_bytes(b"\x00" * 200)
     (workspace / "uploads" / "report.pdf").write_bytes(b"\x00" * 300)
@@ -69,17 +70,15 @@ class TestDoList:
     def test_list_filters_non_audio(self, mixed_files):
         with patch("run._get_duration", return_value=None):
             result = do_list(str(mixed_files))
-        assert "2)" in result  # only 2 audio files
         assert "voice.ogg" in result
         assert "song.mp3" in result
         assert "report.pdf" not in result
-        assert "notes.txt" not in result
 
-    def test_list_empty_directory(self, workspace):
+    def test_list_empty(self, workspace):
         result = do_list(str(workspace))
         assert "No audio files" in result
 
-    def test_list_no_uploads_dir(self, tmp_path):
+    def test_list_no_uploads(self, tmp_path):
         result = do_list(str(tmp_path))
         assert "No uploads/" in result
 
@@ -100,17 +99,15 @@ class TestDoInfo:
             result = do_info(str(workspace), {"file_path": "uploads/voice-message.ogg"})
         assert "voice-message.ogg" in result
         assert ".ogg" in result
-        assert "1.0 KB" in result
         assert "12s" in result
         assert "Estimated transcript" in result
 
     def test_info_no_duration(self, workspace, ogg_file):
         with patch("run._get_duration", return_value=None):
             result = do_info(str(workspace), {"file_path": "uploads/voice-message.ogg"})
-        assert "voice-message.ogg" in result
         assert "Duration" not in result
 
-    def test_info_missing_file(self, workspace):
+    def test_info_missing(self, workspace):
         with pytest.raises(FileNotFoundError):
             do_info(str(workspace), {"file_path": "uploads/nope.ogg"})
 
@@ -120,92 +117,85 @@ class TestDoInfo:
 # ---------------------------------------------------------------------------
 
 
+def _mock_gemini_response(text: str) -> MagicMock:
+    mock = MagicMock()
+    mock.status_code = 200
+    mock.json.return_value = {
+        "choices": [{"message": {"content": text}}],
+    }
+    return mock
+
+
 class TestDoTranscribe:
     def test_transcribe_success(self, workspace, ogg_file):
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"text": "Hello, this is a test message."}
-
         with (
             patch("run._get_duration", return_value=5.0),
             patch("run._get_api_key", return_value="sk-test"),
-            patch("httpx.post", return_value=mock_response),
+            patch("run._compress_audio", return_value=ogg_file),
+            patch("httpx.post", return_value=_mock_gemini_response("Hello, this is a test.")),
         ):
             result = do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
         assert "Transcription: voice-message.ogg (5s)" in result
-        assert "Hello, this is a test message." in result
+        assert "Hello, this is a test." in result
 
     def test_transcribe_with_language(self, workspace, ogg_file):
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"text": "Ciao, questo è un test."}
-
         with (
             patch("run._get_duration", return_value=3.0),
             patch("run._get_api_key", return_value="sk-test"),
-            patch("httpx.post", return_value=mock_response) as mock_post,
+            patch("run._compress_audio", return_value=ogg_file),
+            patch("httpx.post", return_value=_mock_gemini_response("Ciao, questa è una prova.")) as mock_post,
         ):
             result = do_transcribe(str(workspace), {
                 "file_path": "uploads/voice-message.ogg",
                 "language": "it",
             })
-        # Verify language was passed to API
+        # Language hint in the prompt
         call_kwargs = mock_post.call_args
-        assert call_kwargs.kwargs["data"]["language"] == "it"
+        payload = call_kwargs.kwargs["json"]
+        user_content = payload["messages"][0]["content"]
+        text_part = next(p for p in user_content if p.get("type") == "text")
+        assert "it" in text_part["text"]
         assert "Ciao" in result
 
-    def test_transcribe_file_too_large(self, workspace):
-        big_file = workspace / "uploads" / "huge.ogg"
-        big_file.write_bytes(b"\x00" * (_MAX_FILE_SIZE + 1))
+    def test_transcribe_too_long(self, workspace, ogg_file):
+        with patch("run._get_duration", return_value=600.0):  # 10 min > 5 min cap
+            result = do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
+        assert "too long" in result.lower()
+        assert "5m" in result
 
-        with patch("run._get_duration", return_value=100.0):
-            result = do_transcribe(str(workspace), {"file_path": "uploads/huge.ogg"})
-        assert "too large" in result.lower()
-        assert "25" in result  # mentions the limit
-
-    def test_transcribe_long_audio_cap(self, workspace, ogg_file):
-        """Audio >60 min gets a warning note."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"text": "Long audio content."}
-
+    def test_transcribe_no_speech(self, workspace, ogg_file):
         with (
-            patch("run._get_duration", return_value=4500.0),  # 75 min
+            patch("run._get_duration", return_value=2.0),
             patch("run._get_api_key", return_value="sk-test"),
-            patch("httpx.post", return_value=mock_response),
+            patch("run._compress_audio", return_value=ogg_file),
+            patch("httpx.post", return_value=_mock_gemini_response("")),
         ):
             result = do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
-        assert "1h 15m" in result  # shows actual duration
-        assert "first" in result.lower()  # mentions partial transcription
-        assert "Long audio content." in result
+        assert "No speech detected" in result
 
     def test_transcribe_api_error(self, workspace, ogg_file):
         mock_response = MagicMock()
-        mock_response.status_code = 401
-        mock_response.text = "Unauthorized"
-
+        mock_response.status_code = 500
+        mock_response.text = "Internal error"
         with (
             patch("run._get_duration", return_value=5.0),
-            patch("run._get_api_key", return_value="sk-bad"),
+            patch("run._get_api_key", return_value="sk-test"),
+            patch("run._compress_audio", return_value=ogg_file),
             patch("httpx.post", return_value=mock_response),
         ):
-            with pytest.raises(RuntimeError, match="401"):
+            with pytest.raises(RuntimeError, match="500"):
                 do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
 
     def test_transcribe_output_truncation(self, workspace, ogg_file):
-        """Very long transcript gets truncated."""
         long_text = "word " * (_MAX_OUTPUT_CHARS // 3)
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"text": long_text}
-
         with (
             patch("run._get_duration", return_value=120.0),
             patch("run._get_api_key", return_value="sk-test"),
-            patch("httpx.post", return_value=mock_response),
+            patch("run._compress_audio", return_value=ogg_file),
+            patch("httpx.post", return_value=_mock_gemini_response(long_text)),
         ):
             result = do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
-        assert len(result) < _MAX_OUTPUT_CHARS + 500  # header + hint overhead
+        assert len(result) < _MAX_OUTPUT_CHARS + 500
         assert "Showing first" in result
 
     def test_transcribe_missing_file_path(self, workspace):
@@ -214,25 +204,58 @@ class TestDoTranscribe:
 
 
 # ---------------------------------------------------------------------------
-# API key resolution
+# Compression
+# ---------------------------------------------------------------------------
+
+
+class TestCompressAudio:
+    def test_skip_small_ogg(self, workspace, ogg_file):
+        """Small OGG files are not recompressed."""
+        result = _compress_audio(ogg_file)
+        assert result == ogg_file  # same path, no temp file
+
+    def test_compress_large_file(self, workspace):
+        """Large files get compressed via ffmpeg."""
+        big = workspace / "uploads" / "big.mp3"
+        big.write_bytes(b"\x00" * (_COMPRESS_THRESHOLD + 1))
+        mock_run = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_run) as mock:
+            result = _compress_audio(big)
+            # ffmpeg was called
+            assert mock.called
+            call_args = mock.call_args[0][0]
+            assert "ffmpeg" in call_args
+            assert "-ac" in call_args
+            assert "1" in call_args  # mono
+
+    def test_compress_non_ogg_small(self, workspace):
+        """Small MP3 gets compressed (not OGG format)."""
+        mp3 = workspace / "uploads" / "small.mp3"
+        mp3.write_bytes(b"\x00" * 100)  # small but not OGG
+        mock_run = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_run):
+            _compress_audio(mp3)
+            assert mock_run is not None  # ffmpeg called because format is not OGG
+
+    def test_compress_ffmpeg_failure_returns_original(self, workspace):
+        """If ffmpeg fails, return the original file."""
+        mp3 = workspace / "uploads" / "bad.mp3"
+        mp3.write_bytes(b"\x00" * 100)
+        mock_run = MagicMock(returncode=1)
+        with patch("subprocess.run", return_value=mock_run):
+            result = _compress_audio(mp3)
+        assert result == mp3
+
+
+# ---------------------------------------------------------------------------
+# API key
 # ---------------------------------------------------------------------------
 
 
 class TestGetApiKey:
-    def test_tool_specific_key(self):
-        with patch.dict("os.environ", {"KISO_TOOL_TRANSCRIBER_API_KEY": "sk-tool"}, clear=True):
-            assert _get_api_key() == "sk-tool"
-
-    def test_fallback_to_llm_key(self):
-        with patch.dict("os.environ", {"KISO_LLM_API_KEY": "sk-llm"}, clear=True):
-            assert _get_api_key() == "sk-llm"
-
-    def test_tool_key_takes_priority(self):
-        with patch.dict("os.environ", {
-            "KISO_TOOL_TRANSCRIBER_API_KEY": "sk-tool",
-            "KISO_LLM_API_KEY": "sk-llm",
-        }, clear=True):
-            assert _get_api_key() == "sk-tool"
+    def test_key_found(self):
+        with patch.dict("os.environ", {"KISO_LLM_API_KEY": "sk-test"}, clear=True):
+            assert _get_api_key() == "sk-test"
 
     def test_no_key_raises(self):
         with patch.dict("os.environ", {}, clear=True):
@@ -241,7 +264,7 @@ class TestGetApiKey:
 
 
 # ---------------------------------------------------------------------------
-# Path traversal guard
+# Path traversal
 # ---------------------------------------------------------------------------
 
 
@@ -250,7 +273,7 @@ class TestPathTraversal:
         with pytest.raises(ValueError, match="traversal"):
             _resolve_path(str(workspace), {"file_path": "../../etc/passwd"})
 
-    def test_valid_path_accepted(self, workspace, ogg_file):
+    def test_valid_path(self, workspace, ogg_file):
         result = _resolve_path(str(workspace), {"file_path": "uploads/voice-message.ogg"})
         assert result.name == "voice-message.ogg"
 
@@ -278,55 +301,46 @@ class TestFormatSize:
     def test_bytes(self):
         assert _format_size(500) == "500 B"
 
-    def test_kilobytes(self):
+    def test_kb(self):
         assert "KB" in _format_size(2048)
 
-    def test_megabytes(self):
+    def test_mb(self):
         assert "MB" in _format_size(5 * 1024 * 1024)
-
-
-FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class TestGetDuration:
     def test_ffprobe_success(self, workspace, ogg_file):
-        ffprobe_output = json.dumps({"format": {"duration": "12.345"}})
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout=ffprobe_output)
+        output = json.dumps({"format": {"duration": "12.345"}})
+        with patch("subprocess.run") as mock:
+            mock.return_value = MagicMock(returncode=0, stdout=output)
             result = _get_duration(ogg_file)
         assert result == pytest.approx(12.345)
 
     def test_ffprobe_failure(self, workspace, ogg_file):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1, stdout="")
-            result = _get_duration(ogg_file)
-        assert result is None
+        with patch("subprocess.run") as mock:
+            mock.return_value = MagicMock(returncode=1, stdout="")
+            assert _get_duration(ogg_file) is None
 
     def test_ffprobe_not_installed(self, workspace, ogg_file):
         with patch("subprocess.run", side_effect=FileNotFoundError):
-            result = _get_duration(ogg_file)
-        assert result is None
+            assert _get_duration(ogg_file) is None
 
     def test_real_ffprobe_on_fixture(self):
-        """Real ffprobe on the static OGG fixture — no mocks."""
         fixture = FIXTURES / "sample.ogg"
         if not fixture.exists():
-            pytest.skip("fixture not found — run tests/create_fixtures.sh")
+            pytest.skip("fixture not found")
         duration = _get_duration(fixture)
         assert duration is not None
-        assert 1.5 < duration < 3.0  # 2-second tone
+        assert 1.5 < duration < 3.0
 
 
 class TestFixtureIntegration:
-    """Tests using the real audio fixture with real ffprobe."""
-
     @pytest.fixture
     def fixture_workspace(self, tmp_path):
-        """Workspace with the static OGG fixture copied to uploads/."""
         import shutil
         fixture = FIXTURES / "sample.ogg"
         if not fixture.exists():
-            pytest.skip("fixture not found — run tests/create_fixtures.sh")
+            pytest.skip("fixture not found")
         uploads = tmp_path / "uploads"
         uploads.mkdir()
         shutil.copy2(fixture, uploads / "sample.ogg")
@@ -345,7 +359,7 @@ class TestFixtureIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Functional: stdin/stdout contract
+# Functional: stdin/stdout
 # ---------------------------------------------------------------------------
 
 

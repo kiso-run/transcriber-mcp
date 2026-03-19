@@ -1,8 +1,8 @@
 [kiso]
 type = "tool"
 name = "transcriber"
-version = "0.1.0"
-description = "Transcribe audio files (voice messages, recordings) to text via Whisper API"
+version = "0.2.0"
+description = "Transcribe audio files (voice messages, recordings) to text via Gemini multimodal"
 
 [kiso.tool]
 summary = "Transcribe audio files to text — voice messages, recordings, podcasts"
@@ -16,8 +16,8 @@ Actions:
   info       — show audio file metadata (format, duration, size) without transcribing.
   list       — list audio files in uploads/ directory.
 
-For long audio files (>10 min), the tool automatically segments the audio and \
-transcribes each segment, returning a combined result with timestamps.
+Max duration: 5 minutes. Longer files should be split first.
+Uses the same API key as kiso (OpenRouter) — no extra configuration needed.
 
 The file_path arg is relative to the session workspace (e.g. "uploads/voice-message.ogg")."""
 
@@ -26,10 +26,6 @@ action    = { type = "string", required = false, description = "one of: transcri
 file_path = { type = "string", required = false, description = "path to audio file, relative to workspace" }
 language  = { type = "string", required = false, description = "ISO 639-1 language hint (e.g. 'en', 'it') — improves accuracy" }
 
-[kiso.tool.env]
-# Uses the same LLM API key as kiso (OpenRouter). No extra key needed.
-# Override with KISO_TOOL_TRANSCRIBER_API_KEY if using a different provider.
-
 [kiso.deps]
 python = ">=3.11"
-bin = ["ffprobe"]
+bin = ["ffmpeg", "ffprobe"]
