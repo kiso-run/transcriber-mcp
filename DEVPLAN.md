@@ -1,33 +1,36 @@
 # tool-transcriber — Development Plan
 
-Audio transcription tool for kiso. Converts voice messages and audio files to text via Whisper API.
+Audio transcription tool for kiso. Converts voice messages and audio files to text using Gemini multimodal input via OpenRouter.
 
 ## Architecture
 
 ```
-stdin (JSON) → run.py → resolve audio file → Whisper API → stdout (text)
+stdin (JSON) → run.py → resolve audio → ffmpeg compress → base64 → Gemini chat → stdout (text)
 ```
 
 - **Entry point**: `run.py` reads JSON from stdin, dispatches to action handler
 - **Actions**: `transcribe` (default), `info`, `list`
-- **API**: OpenAI Whisper (`whisper-1`) via OpenRouter or direct OpenAI
-- **API key**: reuses `KISO_LLM_API_KEY` by default, override with `KISO_TOOL_TRANSCRIBER_API_KEY`
-- **Cost guard**: hard cap at 60 min, output cap at 50K chars
-- **System dep**: `ffprobe` (from ffmpeg) for duration detection
+- **API**: Gemini 2.5 Flash via OpenRouter `/chat/completions` (audio as base64 inline content)
+- **API key**: reuses `KISO_LLM_API_KEY` — same key as all other kiso LLM calls, zero extra config
+- **Compression**: ffmpeg converts to OGG Opus mono 16kHz 32kbps before sending (speech-optimized)
+- **Cost guard**: hard cap at 5 min audio, output cap at 50K chars
+- **System dep**: `ffmpeg` / `ffprobe` for compression and duration detection
 
 ## Token / Cost Strategy
 
-Whisper charges ~$0.006/min. Voice messages are typically 5-30s (~$0.003).
-Long recordings need protection:
+Gemini 2.5 Flash tokenizes audio at **32 tokens/second**. At $0.15/1M input tokens:
 
-| Duration | Strategy | Est. cost |
-|----------|----------|-----------|
-| <10 min | Single API call | <$0.06 |
-| 10-60 min | Single call (Whisper handles internally) | <$0.36 |
-| >60 min | Transcribe first 60 min, return partial + note | $0.36 cap |
+| Duration | Token audio | Cost | vs Whisper |
+|----------|------------|------|-----------|
+| 15 sec (typical voice msg) | 480 | **$0.00007** | 20x cheaper |
+| 1 min | 1,920 | **$0.0003** | 20x cheaper |
+| 5 min (hard cap) | 9,600 | **$0.0014** | 20x cheaper |
 
-Output budget: 50K chars ≈ ~66 min of speech (150 words/min × 5 chars/word).
-Transcription fits in output budget for any audio under the 60 min cap.
+100 voice messages/day at 15s each = **$0.007/day**.
+
+Compressed audio size: 5 min at 32kbps = ~1.2 MB → ~1.6 MB base64. Well within Gemini's input limits.
+
+Output budget: 50K chars ≈ ~66 min of speech. Always fits within cap.
 
 ## M1 — Core implementation ✅
 
@@ -66,8 +69,48 @@ Transcription fits in output budget for any audio under the 60 min cap.
 - [ ] Verify `kiso tool install transcriber` works end-to-end (needs Docker + VPS)
 - [ ] Live test: send voice message via Discord → transcription appears in response
 
+## M5 — Rewrite: Whisper API → Gemini multimodal via OpenRouter
+
+**Problem:** Whisper API is OpenAI-only — doesn't go through OpenRouter. Requires separate API key + config. Breaks kiso's "single provider" model.
+
+**Solution:** Use Gemini 2.5 Flash's audio input capability via OpenRouter's standard `/chat/completions`. Send audio as base64 inline content, get text back. Same API key, same provider, 20x cheaper.
+
+### Audio compression pipeline
+- [ ] `_compress_audio(path) -> Path` — ffmpeg converts any input format to OGG Opus mono 16kHz 32kbps into a temp file
+- [ ] Skip compression if file is already small enough (<500 KB) and in a supported format
+- [ ] Temp file cleanup after API call
+
+### API rewrite
+- [ ] Replace `_call_whisper_api()` with `_call_gemini_transcribe(file_path, api_key, language)`
+- [ ] Read compressed audio → base64 encode → build chat message with audio content part
+- [ ] Model: `google/gemini-2.5-flash-lite` (cheapest, audio-capable)
+- [ ] System prompt: "Transcribe the audio exactly. Return only the transcription text, no commentary."
+- [ ] Language hint: if provided, add to system prompt ("The audio is in {language}.")
+- [ ] Base URL: OpenRouter default (`https://openrouter.ai/api/v1`), configurable via `KISO_TOOL_TRANSCRIBER_BASE_URL`
+
+### Cost guard update
+- [ ] Hard cap: 5 min (was 60 min) — Gemini handles it fine but keeps costs predictable
+- [ ] File size check after compression (not before) — reject if compressed >5 MB
+- [ ] Duration check via ffprobe: reject >5 min with message suggesting to split the file
+
+### Config simplification
+- [ ] API key: `KISO_LLM_API_KEY` only (remove `KISO_TOOL_TRANSCRIBER_API_KEY` fallback — no separate key needed)
+- [ ] Remove `[kiso.tool.env]` section from kiso.toml (no tool-specific env vars)
+- [ ] Update README: no OpenAI key needed, uses kiso's existing OpenRouter key
+
+### Tests update
+- [ ] Update mocked API response format (chat completion response, not Whisper response)
+- [ ] Add test for compression pipeline (mock ffmpeg subprocess)
+- [ ] Add test: skip compression for small OGG files
+- [ ] Update functional tests
+- [ ] All existing test scenarios still covered (truncation, file size, duration cap, etc.)
+
+### Validation
+- [ ] `uv run pytest tests/ -q` passes
+- [ ] Manual test: transcribe `/home/ymx1zq/Downloads/example.mp3` ("questa è una prova") → correct Italian text
+
 ## Known Issues
 
-- Whisper API has 25 MB file size limit — very long recordings in high-quality formats may need compression
-- No speaker diarization (who said what) — Whisper returns flat text
-- Language auto-detection works but explicit hint improves accuracy significantly
+- Gemini audio input: no speaker diarization (who said what) — returns flat text
+- Compression to 32kbps is speech-optimized — music/complex audio may lose quality (acceptable for voice messages)
+- Very noisy audio may produce lower quality transcription than Whisper (trade-off for cost + simplicity)
