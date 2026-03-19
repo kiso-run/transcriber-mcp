@@ -6,6 +6,7 @@ description = "Transcribe audio files (voice messages, recordings) to text via G
 
 [kiso.tool]
 summary = "Transcribe audio files to text — voice messages, recordings, podcasts"
+consumes = ["audio"]
 usage_guide = """\
 Use this tool to transcribe audio files to text. Supports all common audio formats \
 (OGG, MP3, M4A, WAV, WEBM, FLAC). Audio files are typically found in the uploads/ \

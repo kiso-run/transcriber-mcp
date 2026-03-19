@@ -133,3 +133,15 @@ Output budget: 50K chars ≈ ~66 min of speech. Always fits within cap.
 - Gemini audio input: no speaker diarization (who said what) — returns flat text
 - Compression to 32kbps is speech-optimized — music/complex audio may lose quality (acceptable for voice messages)
 - Very noisy audio may produce lower quality transcription than Whisper (trade-off for cost + simplicity)
+
+---
+
+### M7 — Declare `consumes` in kiso.toml (core M826)
+
+**Context:** Core M826 adds a `consumes` field to `[kiso.tool]` in kiso.toml. The planner uses
+this to auto-route session workspace files to the right tool. Vocabulary: `image`, `document`,
+`audio`, `video`, `code`, `web_page`.
+
+**Changes:**
+- [x] Add `consumes = ["audio"]` to `[kiso.tool]` in kiso.toml
+- [ ] Enrich `usage_guide` with concrete arg examples and supported formats list
