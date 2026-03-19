@@ -277,6 +277,17 @@ class TestPathTraversal:
         result = _resolve_path(str(workspace), {"file_path": "uploads/voice-message.ogg"})
         assert result.name == "voice-message.ogg"
 
+    def test_traversal_lateral_escape(self, tmp_path):
+        """Sibling directory escape via prefix attack."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        sibling = tmp_path / "workspace-data"
+        sibling.mkdir()
+        secret = sibling / "file.ogg"
+        secret.write_bytes(b"\x00" * 100)
+        with pytest.raises(ValueError, match="traversal"):
+            _resolve_path(str(workspace), {"file_path": "../workspace-data/file.ogg"})
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -403,3 +414,13 @@ class TestFunctional:
         )
         assert result.returncode == 1
         assert "unknown" in result.stderr.lower()
+
+    def test_malformed_json_stdin(self, workspace):
+        """Malformed JSON input → exit 1, stderr contains error."""
+        result = subprocess.run(
+            [sys.executable, "run.py"],
+            input="not json", capture_output=True, text=True,
+            cwd=str(Path(__file__).parent.parent),
+        )
+        assert result.returncode == 1
+        assert "invalid json" in result.stderr.lower() or "json" in result.stderr.lower()

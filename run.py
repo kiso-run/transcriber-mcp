@@ -41,7 +41,11 @@ _SYSTEM_PROMPT = (
 
 
 def main() -> None:
-    data = json.load(sys.stdin)
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError as e:
+        print(f"Invalid JSON input: {e}", file=sys.stderr)
+        sys.exit(1)
     args = data.get("args", {})
     workspace = data.get("workspace", ".")
 
@@ -221,7 +225,10 @@ def _call_gemini_transcribe(
     url = f"{base_url}/chat/completions"
 
     audio_data = base64.b64encode(file_path.read_bytes()).decode()
-    mime_type = "audio/ogg"  # always OGG after compression
+
+    # Detect actual audio format from extension (compression may have failed)
+    _FORMAT_MAP = {".ogg": "ogg", ".mp3": "mp3", ".wav": "wav", ".m4a": "m4a"}
+    audio_format = _FORMAT_MAP.get(file_path.suffix.lower(), "ogg")
 
     prompt = _SYSTEM_PROMPT
     if language:
@@ -237,7 +244,7 @@ def _call_gemini_transcribe(
                         "type": "input_audio",
                         "input_audio": {
                             "data": audio_data,
-                            "format": "ogg",
+                            "format": audio_format,
                         },
                     },
                     {
@@ -247,7 +254,7 @@ def _call_gemini_transcribe(
                 ],
             },
         ],
-        "max_tokens": 4096,
+        "max_tokens": 512,
     }
 
     response = httpx.post(
@@ -268,7 +275,7 @@ def _call_gemini_transcribe(
     result = response.json()
     choices = result.get("choices", [])
     if not choices:
-        return ""
+        raise RuntimeError("Gemini returned no output")
     return choices[0].get("message", {}).get("content", "")
 
 
@@ -284,7 +291,9 @@ def _resolve_path(workspace: str, args: dict) -> Path:
         raise ValueError("file_path argument is required for transcribe/info actions")
     resolved = (Path(workspace) / file_path).resolve()
     ws_resolved = Path(workspace).resolve()
-    if not str(resolved).startswith(str(ws_resolved)):
+    try:
+        resolved.relative_to(ws_resolved)
+    except ValueError:
         raise ValueError(f"Path traversal denied: {file_path}")
     if not resolved.is_file():
         raise FileNotFoundError(resolved.name)
