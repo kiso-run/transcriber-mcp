@@ -41,17 +41,16 @@ Transcription fits in output budget for any audio under the 60 min cap.
 - [x] Output truncation at 50K chars with line-boundary cut
 - [x] Configurable base URL (KISO_TOOL_TRANSCRIBER_BASE_URL)
 
-## M2 — Unit tests
+## M2 — Unit tests ✅
 
-- [ ] Test `do_list` with audio files, mixed files, empty dir, no uploads/
-- [ ] Test `do_info` with mocked ffprobe (duration, size, format)
-- [ ] Test `do_transcribe` with mocked Whisper API response
-- [ ] Test API key resolution (tool-specific → LLM fallback → error)
-- [ ] Test file size guard (>25 MB rejected)
-- [ ] Test path traversal guard
-- [ ] Test output truncation on very long transcript
-- [ ] Test `_format_duration` and `_format_size` helpers
-- [ ] Functional test: stdin/stdout contract (list, transcribe, missing file)
+- [x] `do_list`: audio files, mixed (filters non-audio), empty dir, no uploads/, duration display
+- [x] `do_info`: basic with duration, without duration, missing file
+- [x] `do_transcribe`: success, with language, file too large, long audio cap (60 min), API error, output truncation, missing file_path
+- [x] API key resolution: tool-specific, LLM fallback, priority, no key error
+- [x] Path traversal guard
+- [x] `_format_duration`, `_format_size`, `_get_duration` (ffprobe success/failure/not installed)
+- [x] Functional: list via stdin, missing file exits 1, unknown action exits 1
+- 34 tests, all passing
 
 ## M3 — Static fixture files
 
