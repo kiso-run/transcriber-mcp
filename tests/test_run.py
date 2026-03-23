@@ -169,6 +169,7 @@ class TestDoTranscribe:
             patch("run._get_api_key", return_value="sk-test"),
             patch("run._compress_audio", return_value=ogg_file),
             patch("httpx.post", return_value=_mock_gemini_response("")),
+            patch("run.time.sleep"),
         ):
             result = do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
         assert "No speech detected" in result
@@ -202,8 +203,8 @@ class TestDoTranscribe:
         with pytest.raises(ValueError, match="file_path"):
             do_transcribe(str(workspace), {})
 
-    def test_transcribe_empty_choices(self, workspace, ogg_file):
-        """Empty choices array from API → RuntimeError, not 'no speech'."""
+    def test_transcribe_empty_choices_after_retries(self, workspace, ogg_file):
+        """Empty choices on all attempts → 'No speech detected'."""
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {"choices": []}
@@ -212,9 +213,10 @@ class TestDoTranscribe:
             patch("run._get_api_key", return_value="sk-test"),
             patch("run._compress_audio", return_value=ogg_file),
             patch("httpx.post", return_value=mock_response),
+            patch("run.time.sleep"),
         ):
-            with pytest.raises(RuntimeError, match="no output"):
-                do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
+            result = do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
+        assert "No speech detected" in result
 
     def test_transcribe_malformed_response(self, workspace, ogg_file):
         """API returns choices with missing message/content keys → empty text → 'No speech'."""
@@ -226,6 +228,7 @@ class TestDoTranscribe:
             patch("run._get_api_key", return_value="sk-test"),
             patch("run._compress_audio", return_value=ogg_file),
             patch("httpx.post", return_value=mock_response),
+            patch("run.time.sleep"),
         ):
             result = do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
         assert "No speech detected" in result
@@ -237,9 +240,26 @@ class TestDoTranscribe:
             patch("run._get_api_key", return_value="sk-test"),
             patch("run._compress_audio", return_value=ogg_file),
             patch("httpx.post", return_value=_mock_gemini_response("   \n\n   ")),
+            patch("run.time.sleep"),
         ):
             result = do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
         assert "No speech detected" in result
+
+    def test_transcribe_retry_succeeds(self, workspace, ogg_file):
+        """Empty response on first call, success on retry."""
+        empty = MagicMock()
+        empty.status_code = 200
+        empty.json.return_value = {"choices": [{"message": {"content": ""}}]}
+        success = _mock_gemini_response("Hello world transcription")
+        with (
+            patch("run._get_duration", return_value=5.0),
+            patch("run._get_api_key", return_value="sk-test"),
+            patch("run._compress_audio", return_value=ogg_file),
+            patch("httpx.post", side_effect=[empty, success]),
+            patch("run.time.sleep"),
+        ):
+            result = do_transcribe(str(workspace), {"file_path": "uploads/voice-message.ogg"})
+        assert "Hello world transcription" in result
 
 
 # ---------------------------------------------------------------------------
