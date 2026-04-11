@@ -1,4 +1,4 @@
-"""tool-transcriber — transcribe audio files to text via Gemini multimodal.
+"""wrapper-transcriber — transcribe audio files to text via Gemini multimodal.
 
 Subprocess contract (same as all kiso tools):
   stdin:  JSON {args, session, workspace, session_secrets, plan_outputs}
@@ -222,7 +222,7 @@ def _call_gemini_transcribe(
     import httpx
 
     base_url = os.environ.get(
-        "KISO_TOOL_TRANSCRIBER_BASE_URL",
+        "KISO_WRAPPER_TRANSCRIBER_BASE_URL",
         "https://openrouter.ai/api/v1",
     )
     url = f"{base_url}/chat/completions"
