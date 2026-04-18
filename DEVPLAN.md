@@ -1,4 +1,51 @@
-# tool-transcriber — Development Plan
+# kiso-transcriber-mcp — Development Plan
+
+## Status
+
+**Legacy wrapper era — closed.** The `tool-transcriber` /
+`wrapper-transcriber` subprocess-contract implementation has been
+replaced by a Model Context Protocol server built on the official
+`mcp` Python SDK.
+
+**Current era: MCP server.** Tracked in `kiso-run/core` as M1509.
+
+---
+
+## v0.1 — MCP rewrite (2026-04-18)
+
+- [x] Strip legacy wrapper files (`run.py`, `kiso.toml`, `deps.sh`,
+      `validator.py`); preserve `tests/fixtures/sample.ogg`
+- [x] New `pyproject.toml` with package name
+      `kiso-transcriber-mcp`, entry point, MCP SDK dep
+- [x] `src/kiso_transcriber_mcp/transcriber_runner.py` — ffmpeg
+      compression, duration guard, Gemini 2.5 Flash Lite call via
+      OpenRouter, empty-response retry
+- [x] `src/kiso_transcriber_mcp/server.py` — FastMCP server with
+      three tools: `transcribe_audio`, `audio_info`, `doctor`
+- [x] 24 unit tests + 1 live test (fixture round-trip through
+      OpenRouter), all green
+- [x] README rewrite (MCP install, tools, env, client config)
+- [ ] Cut `v0.1.0` tag on GitHub *(user action)*
+- [ ] GitHub Actions CI *(deferred, not blocking no-gap invariant)*
+
+**Design shifts from wrapper era**:
+
+- **Single key**: only `OPENROUTER_API_KEY`. Dropped the
+  `KISO_LLM_API_KEY` / `KISO_WRAPPER_TRANSCRIBER_BASE_URL`
+  indirection — the OpenRouter base URL is hard-coded in the runner.
+- **Dropped the `list` action**: an MCP server shouldn't list an
+  arbitrary `uploads/` directory. File discovery is the caller's
+  responsibility; the server only acts on an explicit `file_path`.
+- **Structured return**: `{success, text, duration_sec, format,
+  truncated, stderr}` instead of a plaintext header + body blob.
+- **No sandboxed workspace**: the wrapper-era path traversal check
+  was for the kiso session sandbox. MCP servers are invoked by
+  trusted clients; path scoping is the caller's concern.
+
+The content below is the original wrapper-era devplan, kept for
+historical record.
+
+---
 
 Audio transcription tool for kiso. Converts voice messages and audio files to text using Gemini multimodal input via OpenRouter.
 
