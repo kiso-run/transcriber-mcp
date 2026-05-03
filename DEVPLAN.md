@@ -192,3 +192,65 @@ this to auto-route session workspace files to the right tool. Vocabulary: `image
 **Changes:**
 - [x] Add `consumes = ["audio"]` to `[kiso.tool]` in kiso.toml
 - [ ] Enrich `usage_guide` with concrete arg examples and supported formats list
+
+---
+
+## v0.2 — Pluggable backend (local-first)
+
+**Motivation**. Same shape as the ocr-mcp v0.2 motivation — but for audio, the privacy concern is even sharper. Audio recordings of internal meetings carry decisions, prices, strategies, customer data, sometimes confidential conversations. Sending every voice message or meeting recording to Gemini via OpenRouter is a non-starter for many B2B EU consumers.
+
+The fix is a pluggable backend — Whisper.cpp local default, Gemini opt-in for quality boost. Whisper supports Italian natively with excellent quality, runs on CPU (no GPU required for small/medium models), is open-source, and has zero per-call cost. Gemini stays available for power users / quality-critical tasks where the consumer accepts data egress.
+
+### M1 — Whisper.cpp backend ✅
+
+- [x] System dependency: `whisper-cli` binary from whisper.cpp + a ggml model file. Path is supplied via env var (`KISO_TRANSCRIBER_WHISPER_MODEL_PATH`); container-image bundling lives downstream in the consumer's appliance Dockerfile, not here.
+- [x] Implemented `_transcribe_whisper(audio_path, language?)` runner — invokes the configured binary (default `whisper-cli`) via subprocess with `-m <model> -f <audio> --output-txt --no-timestamps [-l <lang>]`, 600s timeout
+- [x] Reuses the existing ffmpeg compression pipeline (works for both backends)
+- [x] Output post-processing: `_strip_whisper_artifacts()` removes language tags (`[it]`) and trailing/leading blank lines from the output
+- [x] Unit tests cover: subprocess invocation with correct flags, missing model path raises, missing binary raises, nonzero exit raises, language hint passed, response includes `backend` field, output truncation, no-API-key needed
+- [x] Duration cap raised to 60 min on `whisper-cpp` backend (Gemini's 5-min cap stays on `gemini` only); documented as a feature in README
+
+### M2 — Pluggable backend selection: `whisper-cpp` (default) | `gemini` ✅
+
+- [x] New env var `KISO_TRANSCRIBER_BACKEND` with values `whisper-cpp` (new default) and `gemini` (opt-in, preserves v0.1 behaviour)
+- [x] Internal dispatcher in `transcribe_audio()` resolves backend per-call; both tools work on both backends
+- [x] Migration note in README — existing consumers set `KISO_TRANSCRIBER_BACKEND=gemini` to preserve v0.1 behaviour
+- [x] Unit tests for both backend paths with mocked subprocess (Whisper) and mocked HTTP (Gemini)
+
+### M3 — Whisper.cpp model size management ✅
+
+- [x] README documents model size trade-offs (tiny / base / small / medium / large-v3) with file sizes, speed, and quality notes
+- [x] Env var `KISO_TRANSCRIBER_WHISPER_MODEL_PATH` — full path to the ggml file, gives the consumer full control over which model to use
+- [x] Env var `KISO_TRANSCRIBER_WHISPER_BIN` — override the binary name/path (whisper.cpp builds vary: `whisper-cli`, `main`, etc.)
+- [ ] *Deferred:* container-image build pipeline that downloads the configured model size at build time — that lives in the consumer's appliance Dockerfile (Cerase will handle this in its own Helm chart values), not in this plugin's repo
+
+### M4 — Doctor + observability ✅
+
+- [x] `doctor()` extended: reports active backend, validates ffmpeg/ffprobe presence, checks whisper-cli binary presence and model file existence (for `whisper-cpp`) or `OPENROUTER_API_KEY` (for `gemini`); reports `whisper_model_path` field
+- [ ] *Deferred:* live smoke transcription inside `doctor()` — the configuration check is sufficient at health-check time; smoke tests live in the test suite
+- [x] Per-call return includes `backend` field for auditability
+
+### M5 — Quality trade-off documentation ✅
+
+- [x] README "When to use which backend" section: Whisper.cpp for routine voice/meetings, Gemini for noisy/multi-speaker/unknown-language
+- [x] Cost note implicit in README (Whisper.cpp free per call CPU-bound; Gemini paid)
+- [x] Privacy note in README (Whisper.cpp local, no egress — rationale for being the new default for B2B internal recordings)
+
+### Cut criteria for v0.2.0 ✅
+
+- [x] M1–M5 implemented and tested
+- [x] All existing v0.1 tests still green when `KISO_TRANSCRIBER_BACKEND=gemini` (preserved via `_force_gemini_backend` autouse fixture in TestTranscribeAudio + TestCheckHealth)
+- [x] README rewrite covers both backends and the migration note
+- [x] `pyproject.toml` version bumped to `0.2.0`
+- [ ] Cut `v0.2.0` tag on GitHub *— maintainer action: `git tag v0.2.0 && git push --tags`*
+
+**Effort estimate**: ~3–4 days total. **Actual: completed in one TDD session with 41/41 tests green.**
+
+---
+
+## Out of scope for v0.2
+
+- faster-whisper (CTranslate2 backend). Faster than whisper.cpp but requires more setup and CUDA for serious speed gains. whisper.cpp is the best CPU-only baseline; revisit if a consumer with GPU appliances asks for it.
+- Speaker diarization (WhisperX, pyannote). Out of scope for a transcription server; if needed it goes in a separate `kiso-diarization-mcp` plugin.
+- Real-time / streaming transcription. The MCP tool semantics are request/response on a complete file. Real-time scenarios need a different transport (WebSocket, MCP streaming once supported), out of scope here.
+- Translation alongside transcription. Whisper has a translate-to-English mode, but exposing it would clutter the tool surface. Translation is the calling LLM's job after transcription.
