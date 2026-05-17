@@ -1,4 +1,4 @@
-"""Unit tests for kiso_transcriber_mcp.transcriber_runner."""
+"""Unit tests for kiso_transcriber_mcp.transcriber_runner — v0.3 cloud-only contract."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,17 +20,63 @@ def audio_file(tmp_path: Path) -> Path:
     return f
 
 
-class TestTranscribeAudio:
-    """Transcription via the Gemini backend (opt-in). Set
-    KISO_TRANSCRIBER_BACKEND=gemini to force this path; the new default
-    is whisper-cpp (see TestTranscribeAudioWhisper)."""
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    for var in (
+        "KISO_TRANSCRIBER_BACKEND",
+        "OPENROUTER_API_KEY",
+        "LITELLM_BASE_URL",
+        "LITELLM_API_KEY",
+        "KISO_TRANSCRIBER_MODEL",
+    ):
+        monkeypatch.delenv(var, raising=False)
 
-    @pytest.fixture(autouse=True)
-    def _force_gemini_backend(self, monkeypatch):
+
+class TestBackendSelection:
+    def test_default_backend_is_openrouter(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+        with patch(
+            "kiso_transcriber_mcp.transcriber_runner._binary_exists",
+            return_value=True,
+        ):
+            h = check_health()
+        assert h["backend"] == "openrouter"
+
+    def test_litellm_backend_selectable(self, monkeypatch):
+        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "litellm")
+        monkeypatch.setenv("LITELLM_BASE_URL", "http://lite:4000")
+        with patch(
+            "kiso_transcriber_mcp.transcriber_runner._binary_exists",
+            return_value=True,
+        ):
+            h = check_health()
+        assert h["backend"] == "litellm"
+
+    def test_unknown_backend_unhealthy(self, monkeypatch):
+        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "bogus")
+        h = check_health()
+        assert h["healthy"] is False
+        assert any("bogus" in i for i in h["issues"])
+
+    def test_whisper_cpp_backend_no_longer_supported(self, monkeypatch):
+        """v0.3 removes the local whisper.cpp backend entirely."""
+        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "whisper-cpp")
+        h = check_health()
+        assert h["healthy"] is False
+        assert any("whisper-cpp" in i.lower() for i in h["issues"])
+
+    def test_gemini_alias_no_longer_supported(self, monkeypatch):
+        """v0.3 renames 'gemini' (old opt-in name) to 'openrouter'."""
         monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "gemini")
+        h = check_health()
+        assert h["healthy"] is False
+        assert any("gemini" in i.lower() for i in h["issues"])
+
+
+class TestTranscribeAudioOpenrouter:
+    """Transcription via the default openrouter backend."""
 
     def test_missing_api_key_fails(self, monkeypatch, audio_file):
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         result = transcribe_audio(file_path=str(audio_file))
         assert result["success"] is False
         assert "OPENROUTER_API_KEY" in result["stderr"]
@@ -53,7 +99,7 @@ class TestTranscribeAudio:
         monkeypatch.setenv("OPENROUTER_API_KEY", "k")
         with patch(
             "kiso_transcriber_mcp.transcriber_runner._get_duration",
-            return_value=900.0,  # 15 min
+            return_value=900.0,  # 15 min — exceeds the 5-min cap
         ):
             result = transcribe_audio(file_path=str(audio_file))
         assert result["success"] is False
@@ -68,7 +114,7 @@ class TestTranscribeAudio:
             "kiso_transcriber_mcp.transcriber_runner._compress_audio",
             side_effect=lambda p: p,
         ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._call_gemini",
+            "kiso_transcriber_mcp.transcriber_runner._call_audio_llm",
             return_value="hello world",
         ):
             result = transcribe_audio(file_path=str(audio_file))
@@ -77,10 +123,10 @@ class TestTranscribeAudio:
         assert result["duration_sec"] == 12.0
         assert result["format"] == "ogg"
         assert result["truncated"] is False
+        assert result["backend"] == "openrouter"
 
     def test_large_transcript_truncates(self, monkeypatch, audio_file):
         monkeypatch.setenv("OPENROUTER_API_KEY", "k")
-        huge = "a" * 100_000
         with patch(
             "kiso_transcriber_mcp.transcriber_runner._get_duration",
             return_value=12.0,
@@ -88,8 +134,8 @@ class TestTranscribeAudio:
             "kiso_transcriber_mcp.transcriber_runner._compress_audio",
             side_effect=lambda p: p,
         ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._call_gemini",
-            return_value=huge,
+            "kiso_transcriber_mcp.transcriber_runner._call_audio_llm",
+            return_value="a" * 100_000,
         ):
             result = transcribe_audio(file_path=str(audio_file))
         assert result["success"] is True
@@ -105,14 +151,14 @@ class TestTranscribeAudio:
             "kiso_transcriber_mcp.transcriber_runner._compress_audio",
             side_effect=lambda p: p,
         ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._call_gemini",
-            side_effect=RuntimeError("API error 500"),
+            "kiso_transcriber_mcp.transcriber_runner._call_audio_llm",
+            side_effect=RuntimeError("audio API error (500): boom"),
         ):
             result = transcribe_audio(file_path=str(audio_file))
         assert result["success"] is False
         assert "500" in result["stderr"]
 
-    def test_language_hint_passed_to_api(self, monkeypatch, audio_file):
+    def test_language_hint_passed_to_call(self, monkeypatch, audio_file):
         monkeypatch.setenv("OPENROUTER_API_KEY", "k")
         with patch(
             "kiso_transcriber_mcp.transcriber_runner._get_duration",
@@ -121,55 +167,173 @@ class TestTranscribeAudio:
             "kiso_transcriber_mcp.transcriber_runner._compress_audio",
             side_effect=lambda p: p,
         ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._call_gemini",
+            "kiso_transcriber_mcp.transcriber_runner._call_audio_llm",
             return_value="ciao",
         ) as call:
             transcribe_audio(file_path=str(audio_file), language="it")
-        assert call.call_args.args[2] == "it"
+        assert call.call_args.kwargs.get("language") == "it"
 
 
-class TestCallGeminiRetry:
-    """Empty-response retry behavior for _call_gemini."""
+class TestTranscribeAudioLitellm:
+    """Transcription via the litellm backend — consumer's local LiteLLM gateway."""
 
-    def test_empty_response_retries_then_returns_empty(self, monkeypatch, audio_file):
-        from kiso_transcriber_mcp import transcriber_runner
+    @pytest.fixture(autouse=True)
+    def _force_litellm(self, monkeypatch):
+        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "litellm")
+        monkeypatch.setenv("LITELLM_BASE_URL", "http://lite:4000")
 
-        monkeypatch.setenv("OPENROUTER_API_KEY", "k")
-        mock_response = MagicMock(status_code=200)
-        mock_response.json.return_value = {
-            "choices": [{"message": {"content": ""}}]
-        }
+    def test_missing_base_url_fails(self, monkeypatch, audio_file):
+        monkeypatch.delenv("LITELLM_BASE_URL", raising=False)
+        result = transcribe_audio(file_path=str(audio_file))
+        assert result["success"] is False
+        assert "LITELLM_BASE_URL" in result["stderr"]
+
+    def test_success_uses_litellm_base_url(self, monkeypatch, audio_file):
         with patch(
-            "httpx.post", return_value=mock_response,
-        ) as post, patch(
-            "kiso_transcriber_mcp.transcriber_runner.time.sleep",
-        ):
-            result = transcriber_runner._call_gemini(audio_file, "k", None)
-        assert result == ""
-        # 1 initial + 2 retries = 3 calls
-        assert post.call_count == 3
+            "kiso_transcriber_mcp.transcriber_runner._get_duration",
+            return_value=12.0,
+        ), patch(
+            "kiso_transcriber_mcp.transcriber_runner._compress_audio",
+            side_effect=lambda p: p,
+        ), patch(
+            "kiso_transcriber_mcp.transcriber_runner._call_audio_llm",
+            return_value="text from litellm",
+        ) as call:
+            result = transcribe_audio(file_path=str(audio_file))
+        assert result["success"] is True
+        assert result["text"] == "text from litellm"
+        assert result["backend"] == "litellm"
+        assert call.call_args.kwargs["base_url"].startswith("http://lite:4000")
 
-    def test_non_empty_response_returns_immediately(self, monkeypatch, audio_file):
+    def test_litellm_api_key_optional(self, monkeypatch, audio_file):
+        monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+        with patch(
+            "kiso_transcriber_mcp.transcriber_runner._get_duration",
+            return_value=12.0,
+        ), patch(
+            "kiso_transcriber_mcp.transcriber_runner._compress_audio",
+            side_effect=lambda p: p,
+        ), patch(
+            "kiso_transcriber_mcp.transcriber_runner._call_audio_llm",
+            return_value="text",
+        ):
+            result = transcribe_audio(file_path=str(audio_file))
+        assert result["success"] is True
+
+
+class TestCallAudioLlm:
+    """Direct unit tests for the single _call_audio_llm function."""
+
+    def test_posts_to_base_url(self, audio_file):
         from kiso_transcriber_mcp import transcriber_runner
 
         mock_response = MagicMock(status_code=200)
         mock_response.json.return_value = {
             "choices": [{"message": {"content": "hello"}}]
         }
-        with patch(
-            "httpx.post", return_value=mock_response,
-        ) as post:
-            result = transcriber_runner._call_gemini(audio_file, "k", None)
-        assert result == "hello"
-        assert post.call_count == 1
+        with patch("httpx.post", return_value=mock_response) as post:
+            text = transcriber_runner._call_audio_llm(
+                base_url="http://example/v1",
+                api_key="k",
+                model="vendor/model",
+                file_path=audio_file,
+                language=None,
+            )
+        assert text == "hello"
+        url = post.call_args.args[0]
+        assert url == "http://example/v1/chat/completions"
 
-    def test_http_error_raises(self, monkeypatch, audio_file):
+    def test_authorization_header_when_key_set(self, audio_file):
+        from kiso_transcriber_mcp import transcriber_runner
+
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": "ok"}}]
+        }
+        with patch("httpx.post", return_value=mock_response) as post:
+            transcriber_runner._call_audio_llm(
+                base_url="http://x/v1",
+                api_key="secret",
+                model="m",
+                file_path=audio_file,
+                language=None,
+            )
+        headers = post.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer secret"
+
+    def test_no_auth_header_when_key_empty(self, audio_file):
+        from kiso_transcriber_mcp import transcriber_runner
+
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": "ok"}}]
+        }
+        with patch("httpx.post", return_value=mock_response) as post:
+            transcriber_runner._call_audio_llm(
+                base_url="http://x/v1",
+                api_key="",
+                model="m",
+                file_path=audio_file,
+                language=None,
+            )
+        headers = post.call_args.kwargs["headers"]
+        assert "Authorization" not in headers
+
+    def test_language_hint_in_prompt(self, audio_file):
+        from kiso_transcriber_mcp import transcriber_runner
+
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": "ciao"}}]
+        }
+        with patch("httpx.post", return_value=mock_response) as post:
+            transcriber_runner._call_audio_llm(
+                base_url="http://x/v1",
+                api_key="k",
+                model="m",
+                file_path=audio_file,
+                language="it",
+            )
+        body = post.call_args.kwargs["json"]
+        # Last message content has both the audio block and a text block;
+        # the text block carries the language hint.
+        text_parts = [
+            c["text"] for c in body["messages"][0]["content"] if c.get("type") == "text"
+        ]
+        assert any("it" in t for t in text_parts)
+
+    def test_empty_response_retries_then_returns_empty(self, audio_file):
+        from kiso_transcriber_mcp import transcriber_runner
+
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": ""}}]
+        }
+        with patch("httpx.post", return_value=mock_response) as post, \
+             patch("kiso_transcriber_mcp.transcriber_runner.time.sleep"):
+            result = transcriber_runner._call_audio_llm(
+                base_url="http://x/v1",
+                api_key="k",
+                model="m",
+                file_path=audio_file,
+                language=None,
+            )
+        assert result == ""
+        assert post.call_count == 3
+
+    def test_http_error_raises(self, audio_file):
         from kiso_transcriber_mcp import transcriber_runner
 
         mock_response = MagicMock(status_code=500, text="server boom")
         with patch("httpx.post", return_value=mock_response), \
              pytest.raises(RuntimeError, match="500"):
-            transcriber_runner._call_gemini(audio_file, "k", None)
+            transcriber_runner._call_audio_llm(
+                base_url="http://x/v1",
+                api_key="k",
+                model="m",
+                file_path=audio_file,
+                language=None,
+            )
 
 
 class TestAudioInfo:
@@ -201,11 +365,7 @@ class TestAudioInfo:
 
 
 class TestCheckHealth:
-    @pytest.fixture(autouse=True)
-    def _force_gemini_backend(self, monkeypatch):
-        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "gemini")
-
-    def test_all_good(self, monkeypatch):
+    def test_openrouter_healthy(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "k")
         with patch(
             "kiso_transcriber_mcp.transcriber_runner._binary_exists",
@@ -214,7 +374,37 @@ class TestCheckHealth:
             h = check_health()
         assert h["healthy"] is True
         assert h["issues"] == []
-        assert h["backend"] == "gemini"
+        assert h["backend"] == "openrouter"
+
+    def test_openrouter_missing_key_unhealthy(self, monkeypatch):
+        with patch(
+            "kiso_transcriber_mcp.transcriber_runner._binary_exists",
+            return_value=True,
+        ):
+            h = check_health()
+        assert h["healthy"] is False
+        assert any("OPENROUTER_API_KEY" in i for i in h["issues"])
+
+    def test_litellm_healthy(self, monkeypatch):
+        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "litellm")
+        monkeypatch.setenv("LITELLM_BASE_URL", "http://lite:4000")
+        with patch(
+            "kiso_transcriber_mcp.transcriber_runner._binary_exists",
+            return_value=True,
+        ):
+            h = check_health()
+        assert h["healthy"] is True
+        assert h["backend"] == "litellm"
+
+    def test_litellm_missing_base_url_unhealthy(self, monkeypatch):
+        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "litellm")
+        with patch(
+            "kiso_transcriber_mcp.transcriber_runner._binary_exists",
+            return_value=True,
+        ):
+            h = check_health()
+        assert h["healthy"] is False
+        assert any("LITELLM_BASE_URL" in i for i in h["issues"])
 
     def test_missing_ffmpeg(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "k")
@@ -230,254 +420,18 @@ class TestCheckHealth:
         assert h["healthy"] is False
         assert any("ffmpeg" in i for i in h["issues"])
 
-    def test_missing_api_key(self, monkeypatch):
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner._binary_exists",
-            return_value=True,
-        ):
-            h = check_health()
-        assert h["healthy"] is False
-        assert any("OPENROUTER_API_KEY" in i for i in h["issues"])
+    def test_no_whisper_probe(self, monkeypatch):
+        """v0.3 removes whisper.cpp — doctor must not probe for whisper-cli."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+        calls = []
 
-
-class TestCheckHealthWhisper:
-    """Health check for the new default backend (whisper-cpp local)."""
-
-    def test_default_backend_is_whisper_cpp(self, monkeypatch):
-        monkeypatch.delenv("KISO_TRANSCRIBER_BACKEND", raising=False)
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        # Need ffmpeg/ffprobe still (used for compression and duration);
-        # whisper-cli also needed.
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner._binary_exists",
-            return_value=True,
-        ):
-            h = check_health()
-        assert h["backend"] == "whisper-cpp"
-
-    def test_reports_model_size(self, monkeypatch):
-        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "whisper-cpp")
-        monkeypatch.setenv("KISO_TRANSCRIBER_WHISPER_MODEL_PATH", "/var/cache/ggml-small.bin")
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner._binary_exists",
-            return_value=True,
-        ), patch("pathlib.Path.is_file", return_value=True):
-            h = check_health()
-        assert h.get("whisper_model_path") == "/var/cache/ggml-small.bin"
-
-    def test_missing_whisper_binary_unhealthy(self, monkeypatch):
-        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "whisper-cpp")
-        monkeypatch.setenv("KISO_TRANSCRIBER_WHISPER_MODEL_PATH", "/var/cache/ggml-small.bin")
-
-        def _exists(name):
-            return name != "whisper-cli"  # everything except whisper-cli present
+        def _track(name):
+            calls.append(name)
+            return True
 
         with patch(
             "kiso_transcriber_mcp.transcriber_runner._binary_exists",
-            side_effect=_exists,
-        ), patch("pathlib.Path.is_file", return_value=True):
-            h = check_health()
-        assert h["healthy"] is False
-        assert any("whisper" in i.lower() for i in h["issues"])
-
-    def test_missing_model_path_unhealthy(self, monkeypatch):
-        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "whisper-cpp")
-        monkeypatch.delenv("KISO_TRANSCRIBER_WHISPER_MODEL_PATH", raising=False)
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner._binary_exists",
-            return_value=True,
+            side_effect=_track,
         ):
-            h = check_health()
-        assert h["healthy"] is False
-        assert any("WHISPER_MODEL_PATH" in i for i in h["issues"])
-
-    def test_unknown_backend_unhealthy(self, monkeypatch):
-        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "bogus")
-        h = check_health()
-        assert h["healthy"] is False
-        assert any("bogus" in i for i in h["issues"])
-
-
-class TestTranscribeAudioWhisper:
-    """Transcription via the local Whisper.cpp backend (new default in v0.2)."""
-
-    @pytest.fixture(autouse=True)
-    def _force_whisper_backend(self, monkeypatch):
-        monkeypatch.setenv("KISO_TRANSCRIBER_BACKEND", "whisper-cpp")
-        monkeypatch.setenv(
-            "KISO_TRANSCRIBER_WHISPER_MODEL_PATH",
-            "/var/cache/ggml-small.bin",
-        )
-
-    def test_no_api_key_required(self, monkeypatch, audio_file):
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner._get_duration",
-            return_value=12.0,
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._compress_audio",
-            side_effect=lambda p: p,
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._transcribe_whisper",
-            return_value="hello local world",
-        ):
-            result = transcribe_audio(file_path=str(audio_file))
-        assert result["success"] is True
-        assert result["text"] == "hello local world"
-        assert result["backend"] == "whisper-cpp"
-
-    def test_no_duration_cap_for_whisper(self, monkeypatch, audio_file):
-        """Gemini's 5-min cap doesn't apply to local Whisper; raise to 60 min."""
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner._get_duration",
-            return_value=20 * 60.0,  # 20 minutes — would fail under Gemini cap
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._compress_audio",
-            side_effect=lambda p: p,
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._transcribe_whisper",
-            return_value="long meeting transcript",
-        ):
-            result = transcribe_audio(file_path=str(audio_file))
-        assert result["success"] is True
-
-    def test_extreme_duration_still_capped(self, monkeypatch, audio_file):
-        """Even Whisper has an internal cap to avoid runaway (60 min)."""
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner._get_duration",
-            return_value=120 * 60.0,  # 2 hours
-        ):
-            result = transcribe_audio(file_path=str(audio_file))
-        assert result["success"] is False
-        assert "too long" in result["stderr"].lower()
-
-    def test_language_hint_passed_to_whisper(self, monkeypatch, audio_file):
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner._get_duration",
-            return_value=12.0,
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._compress_audio",
-            side_effect=lambda p: p,
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._transcribe_whisper",
-            return_value="ciao",
-        ) as run:
-            transcribe_audio(file_path=str(audio_file), language="it")
-        assert run.call_args.kwargs.get("language") == "it"
-
-    def test_subprocess_error_surfaces(self, monkeypatch, audio_file):
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner._get_duration",
-            return_value=12.0,
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._compress_audio",
-            side_effect=lambda p: p,
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._transcribe_whisper",
-            side_effect=RuntimeError("whisper-cli: model not found"),
-        ):
-            result = transcribe_audio(file_path=str(audio_file))
-        assert result["success"] is False
-        assert "whisper" in result["stderr"].lower()
-
-    def test_truncates_long_output(self, monkeypatch, audio_file):
-        long_text = "x" * 100_000
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner._get_duration",
-            return_value=12.0,
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._compress_audio",
-            side_effect=lambda p: p,
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._transcribe_whisper",
-            return_value=long_text,
-        ):
-            result = transcribe_audio(file_path=str(audio_file))
-        assert result["truncated"] is True
-        assert len(result["text"]) <= 50_000
-
-    def test_response_includes_backend_field(self, monkeypatch, audio_file):
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner._get_duration",
-            return_value=12.0,
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._compress_audio",
-            side_effect=lambda p: p,
-        ), patch(
-            "kiso_transcriber_mcp.transcriber_runner._transcribe_whisper",
-            return_value="text",
-        ):
-            result = transcribe_audio(file_path=str(audio_file))
-        assert result.get("backend") == "whisper-cpp"
-
-
-class TestWhisperRunner:
-    """Direct unit tests for the _transcribe_whisper subprocess wrapper."""
-
-    def test_invokes_whisper_cli(self, audio_file, monkeypatch):
-        from kiso_transcriber_mcp import transcriber_runner
-
-        monkeypatch.setenv(
-            "KISO_TRANSCRIBER_WHISPER_MODEL_PATH", "/cache/ggml-small.bin",
-        )
-        completed = MagicMock(returncode=0, stdout="transcript text\n", stderr="")
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner.subprocess.run",
-            return_value=completed,
-        ) as run:
-            text = transcriber_runner._transcribe_whisper(audio_file, language="it")
-        # Trailing newline stripped by _strip_whisper_artifacts.
-        assert text == "transcript text"
-        cmd = run.call_args.args[0]
-        assert cmd[0] == "whisper-cli" or cmd[0].endswith("whisper-cli")
-        assert "/cache/ggml-small.bin" in cmd  # model path passed via -m
-        assert str(audio_file) in cmd
-        assert "it" in cmd  # language hint
-
-    def test_binary_override_via_env(self, audio_file, monkeypatch):
-        from kiso_transcriber_mcp import transcriber_runner
-
-        monkeypatch.setenv(
-            "KISO_TRANSCRIBER_WHISPER_MODEL_PATH", "/cache/ggml-small.bin",
-        )
-        monkeypatch.setenv("KISO_TRANSCRIBER_WHISPER_BIN", "/opt/whisper.cpp/main")
-        completed = MagicMock(returncode=0, stdout="t", stderr="")
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner.subprocess.run",
-            return_value=completed,
-        ) as run:
-            transcriber_runner._transcribe_whisper(audio_file, language=None)
-        assert run.call_args.args[0][0] == "/opt/whisper.cpp/main"
-
-    def test_missing_model_path_raises(self, audio_file, monkeypatch):
-        from kiso_transcriber_mcp import transcriber_runner
-
-        monkeypatch.delenv("KISO_TRANSCRIBER_WHISPER_MODEL_PATH", raising=False)
-        with pytest.raises(RuntimeError, match="WHISPER_MODEL_PATH"):
-            transcriber_runner._transcribe_whisper(audio_file, language=None)
-
-    def test_nonzero_exit_raises(self, audio_file, monkeypatch):
-        from kiso_transcriber_mcp import transcriber_runner
-
-        monkeypatch.setenv(
-            "KISO_TRANSCRIBER_WHISPER_MODEL_PATH", "/cache/ggml-small.bin",
-        )
-        completed = MagicMock(returncode=2, stdout="", stderr="model load failed")
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner.subprocess.run",
-            return_value=completed,
-        ), pytest.raises(RuntimeError, match="whisper"):
-            transcriber_runner._transcribe_whisper(audio_file, language=None)
-
-    def test_binary_missing_raises(self, audio_file, monkeypatch):
-        from kiso_transcriber_mcp import transcriber_runner
-
-        monkeypatch.setenv(
-            "KISO_TRANSCRIBER_WHISPER_MODEL_PATH", "/cache/ggml-small.bin",
-        )
-        with patch(
-            "kiso_transcriber_mcp.transcriber_runner.subprocess.run",
-            side_effect=FileNotFoundError("whisper-cli not in PATH"),
-        ), pytest.raises(RuntimeError, match="whisper"):
-            transcriber_runner._transcribe_whisper(audio_file, language=None)
+            check_health()
+        assert not any("whisper" in c.lower() for c in calls)

@@ -257,9 +257,9 @@ The fix is a pluggable backend — Whisper.cpp local default, Gemini opt-in for 
 
 ---
 
-## v0.3 — Cloud-only (2026-05-16)
+## v0.3 — Cloud-only (2026-05-16) ✅
 
-**Status**: planned.
+**Status**: shipped.
 
 **Why this version exists**
 
@@ -278,17 +278,17 @@ Local-STT engines are explicitly out of scope. Air-gapped consumers should fork 
 
 **Tasks** (TDD: tests first, then strip, then green)
 
-- [ ] Update `tests/test_transcriber_runner.py`: drop all whisper.cpp-backend assertions; add tests for `KISO_TRANSCRIBER_BACKEND=litellm` route (mocked HTTP to `LITELLM_BASE_URL`); keep ffmpeg-compression tests (with `ffmpeg`/`ffprobe` mocked via fixtures already in use)
-- [ ] Update `tests/test_server.py`: drop whisper-related tool-arg validation; verify `doctor` no longer probes for `whisper-cli` or ggml model file existence
-- [ ] Run pytest — confirm red
-- [ ] Refactor `src/kiso_transcriber_mcp/transcriber_runner.py`: extract `_call_audio_llm(base_url, api_key, model, audio_bytes)`; backend selector resolves `(base_url, api_key, model)` from env once at startup
-- [ ] Strip whisper.cpp code from `transcriber_runner.py` (subprocess wrapper, ggml model loading, the `KISO_TRANSCRIBER_WHISPER_*` env-var pair)
-- [ ] Refactor `src/kiso_transcriber_mcp/server.py`: drop the whisper-cpp `doctor` branch; simplify backend setup
-- [ ] Update `pyproject.toml`: bump `version = "0.3.0"`; update `description` to "Minimal MCP wrapper around a cloud audio-LLM (OpenRouter direct, or via a consumer's LiteLLM gateway), with local ffmpeg compression to minimise egress"
-- [ ] `uv lock` — refresh `uv.lock`
-- [ ] Run pytest — confirm green
-- [ ] Rewrite `README.md` end-to-end: drop whisper.cpp sections, drop ggml model download instructions, drop `KISO_TRANSCRIBER_WHISPER_*` env vars; explain the `openrouter` vs `litellm` selector; keep ffmpeg section (still required)
-- [ ] Append note to `Out of scope for v0.3`: explicit "no local STT path — by design"
+- [x] Update `tests/test_transcriber_runner.py`: drop all whisper.cpp-backend assertions; add tests for `KISO_TRANSCRIBER_BACKEND=litellm` route (mocked HTTP to `LITELLM_BASE_URL`); keep ffmpeg-compression tests (with `ffmpeg`/`ffprobe` mocked via fixtures already in use)
+- [x] Update `tests/test_server.py`: drop whisper-related tool-arg validation; verify `doctor` no longer probes for `whisper-cli` or ggml model file existence
+- [x] Run pytest — confirm red
+- [x] Refactor `src/kiso_transcriber_mcp/transcriber_runner.py`: extract `_call_audio_llm(base_url, api_key, model, audio_bytes)`; backend selector resolves `(base_url, api_key, model)` from env once at startup
+- [x] Strip whisper.cpp code from `transcriber_runner.py` (subprocess wrapper, ggml model loading, the `KISO_TRANSCRIBER_WHISPER_*` env-var pair)
+- [x] Refactor `src/kiso_transcriber_mcp/server.py`: drop the whisper-cpp `doctor` branch; simplify backend setup
+- [x] Update `pyproject.toml`: bump `version = "0.3.0"`; update `description` to "Minimal MCP wrapper around a cloud audio-LLM (OpenRouter direct, or via a consumer's LiteLLM gateway), with local ffmpeg compression to minimise egress"
+- [x] `uv lock` — refresh `uv.lock`
+- [x] Run pytest — confirm green
+- [x] Rewrite `README.md` end-to-end: drop whisper.cpp sections, drop ggml model download instructions, drop `KISO_TRANSCRIBER_WHISPER_*` env vars; explain the `openrouter` vs `litellm` selector; keep ffmpeg section (still required)
+- [x] Append note to `Out of scope for v0.3`: explicit "no local STT path — by design"
 - [ ] Cut `v0.3.0` tag on GitHub *(user action)*
 
 **Exit gate**

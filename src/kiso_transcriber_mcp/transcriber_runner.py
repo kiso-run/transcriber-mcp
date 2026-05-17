@@ -1,20 +1,18 @@
-"""Audio transcription core — pluggable backend (Whisper.cpp local default, Gemini opt-in).
+"""Audio transcription core — cloud-only MCP wrapper.
 
-Two backends, selected by ``KISO_TRANSCRIBER_BACKEND``:
+Two backends are supported, selected by ``KISO_TRANSCRIBER_BACKEND``:
 
-- ``whisper-cpp`` (default) — local OCR-style transcription via the
-  whisper.cpp ``whisper-cli`` binary. No API key, no data egress, runs
-  in the appliance. Default model file path is configured via
-  ``KISO_TRANSCRIBER_WHISPER_MODEL_PATH`` (point at e.g.
-  ``ggml-small.bin``). The binary defaults to ``whisper-cli`` and can
-  be overridden via ``KISO_TRANSCRIBER_WHISPER_BIN``.
-- ``gemini`` — Gemini 2.5 Flash Lite via OpenRouter. Higher quality on
-  noisy multi-speaker scenes, language identification on unknown-language
-  input. Audio is compressed to OGG Opus 32kbps mono 16kHz before
-  upload. Requires ``OPENROUTER_API_KEY``.
+- ``openrouter`` (default) — direct OpenRouter calls. Requires
+  ``OPENROUTER_API_KEY``.
+- ``litellm`` — calls go through the consumer's local LiteLLM gateway
+  at ``LITELLM_BASE_URL``. Optional ``LITELLM_API_KEY`` (when the
+  gateway requires auth). Use this when audio traffic must flow through
+  the same governance layer as other LLM calls (cost tracking, PII
+  filter, residency tag, quota, fallback).
 
-Both backends share the ffmpeg compression and ffprobe duration
-detection — these stay system-level dependencies.
+ffmpeg + ffprobe remain local system-level dependencies — they compress
+audio to OGG Opus 32kbps mono 16kHz before upload (dramatically smaller
+file, speech-optimised) and detect duration for the input cap.
 """
 from __future__ import annotations
 
@@ -28,14 +26,11 @@ from pathlib import Path
 
 
 _MAX_OUTPUT_CHARS = 50_000
-_MAX_DURATION_GEMINI = 300       # 5 min — Gemini-side cap
-_MAX_DURATION_WHISPER = 60 * 60  # 60 min — internal cap to avoid runaway
+_MAX_DURATION = 300       # 5 min — typical cloud audio-LLM cap
 _COMPRESS_THRESHOLD = 500 * 1024
 _EMPTY_RETRIES = 2
 _RETRY_BACKOFF = (1, 2)
-_WHISPER_TIMEOUT_SECS = 600
-_DEFAULT_WHISPER_BIN = "whisper-cli"
-_SUPPORTED_BACKENDS = {"whisper-cpp", "gemini"}
+_SUPPORTED_BACKENDS = {"openrouter", "litellm"}
 
 _AUDIO_EXTENSIONS = frozenset({
     ".ogg", ".mp3", ".m4a", ".wav", ".webm", ".flac",
@@ -47,8 +42,8 @@ _SYSTEM_PROMPT = (
     "Return only the transcription text, no commentary, timestamps, or formatting."
 )
 
-_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-_GEMINI_MODEL = "google/gemini-2.5-flash-lite"
+_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
 
 
 def transcribe_audio(
@@ -67,24 +62,27 @@ def transcribe_audio(
             f"(use one of: {sorted(_SUPPORTED_BACKENDS)})"
         )
 
-    if backend == "gemini" and not os.environ.get("OPENROUTER_API_KEY"):
-        return _fail("OPENROUTER_API_KEY is not set")
-
     duration = _get_duration(path)
-    cap = _MAX_DURATION_GEMINI if backend == "gemini" else _MAX_DURATION_WHISPER
-    if duration is not None and duration > cap:
+    if duration is not None and duration > _MAX_DURATION:
         return _fail(
-            f"audio too long ({_format_duration(duration)}); max for backend "
-            f"{backend!r} is {_format_duration(cap)}; split the file first"
+            f"audio too long ({_format_duration(duration)}); max is "
+            f"{_format_duration(_MAX_DURATION)}; split the file first"
         )
+
+    try:
+        base_url, api_key, model = _resolve_endpoint(backend)
+    except RuntimeError as exc:
+        return _fail(str(exc), backend=backend)
 
     compressed = _compress_audio(path)
     try:
-        if backend == "whisper-cpp":
-            text = _transcribe_whisper(compressed, language=language)
-        else:
-            api_key = os.environ["OPENROUTER_API_KEY"]
-            text = _call_gemini(compressed, api_key, language)
+        text = _call_audio_llm(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            file_path=compressed,
+            language=language,
+        )
     except RuntimeError as exc:
         return _fail(str(exc), backend=backend)
     finally:
@@ -157,35 +155,36 @@ def check_health() -> dict:
     if not _binary_exists("ffprobe"):
         issues.append("ffprobe not found on PATH (required for duration detection)")
 
-    if backend == "gemini":
-        if not os.environ.get("OPENROUTER_API_KEY"):
-            issues.append("OPENROUTER_API_KEY is not set")
-    elif backend == "whisper-cpp":
-        whisper_bin = os.environ.get("KISO_TRANSCRIBER_WHISPER_BIN", _DEFAULT_WHISPER_BIN)
-        if not _binary_exists(whisper_bin):
-            issues.append(
-                f"whisper-cli binary not found on PATH (looked for {whisper_bin!r}). "
-                "Install whisper.cpp or set KISO_TRANSCRIBER_WHISPER_BIN to its path."
-            )
-        model_path = os.environ.get("KISO_TRANSCRIBER_WHISPER_MODEL_PATH")
-        if not model_path:
-            issues.append(
-                "KISO_TRANSCRIBER_WHISPER_MODEL_PATH is not set "
-                "(point it at a whisper.cpp ggml model file, e.g. ggml-small.bin)"
-            )
-        else:
-            result["whisper_model_path"] = model_path
-            if not Path(model_path).is_file():
-                issues.append(
-                    f"whisper model file not found at {model_path!r}"
-                )
+    try:
+        _resolve_endpoint(backend)
+    except RuntimeError as exc:
+        issues.append(str(exc))
 
     result["healthy"] = not issues
     return result
 
 
 def _backend() -> str:
-    return os.environ.get("KISO_TRANSCRIBER_BACKEND", "whisper-cpp").lower()
+    return os.environ.get("KISO_TRANSCRIBER_BACKEND", "openrouter").lower()
+
+
+def _resolve_endpoint(backend: str) -> tuple[str, str, str]:
+    """Return ``(base_url, api_key, model)`` for the selected backend.
+
+    Raises ``RuntimeError`` if required env vars are missing.
+    """
+    model = os.environ.get("KISO_TRANSCRIBER_MODEL", _DEFAULT_MODEL)
+    if backend == "openrouter":
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is not set")
+        return _OPENROUTER_BASE_URL, api_key, model
+    if backend == "litellm":
+        base_url = os.environ.get("LITELLM_BASE_URL", "").rstrip("/")
+        if not base_url:
+            raise RuntimeError("LITELLM_BASE_URL is not set")
+        return base_url, os.environ.get("LITELLM_API_KEY", ""), model
+    raise RuntimeError(f"unknown backend: {backend}")
 
 
 def _compress_audio(path: Path) -> Path:
@@ -211,63 +210,17 @@ def _compress_audio(path: Path) -> Path:
     return Path(tmp.name)
 
 
-def _transcribe_whisper(file_path: Path, *, language: str | None) -> str:
-    """Invoke the local whisper.cpp binary on the audio file. Returns
-    the extracted text (raw stdout). Raises ``RuntimeError`` on failure."""
-    model_path = os.environ.get("KISO_TRANSCRIBER_WHISPER_MODEL_PATH")
-    if not model_path:
-        raise RuntimeError(
-            "KISO_TRANSCRIBER_WHISPER_MODEL_PATH is not set "
-            "(point it at a whisper.cpp ggml model file, e.g. ggml-small.bin)"
-        )
-    binary = os.environ.get("KISO_TRANSCRIBER_WHISPER_BIN", _DEFAULT_WHISPER_BIN)
-    cmd = [
-        binary,
-        "-m", model_path,
-        "-f", str(file_path),
-        "--output-txt",
-        "--no-timestamps",
-    ]
-    if language:
-        cmd.extend(["-l", language])
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=_WHISPER_TIMEOUT_SECS,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            f"whisper-cli binary not found in PATH: {exc}. "
-            "Install whisper.cpp (build from https://github.com/ggerganov/whisper.cpp) "
-            "or set KISO_TRANSCRIBER_WHISPER_BIN, or switch to KISO_TRANSCRIBER_BACKEND=gemini."
-        ) from exc
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"whisper-cli error ({completed.returncode}): "
-            f"{completed.stderr.strip()[:500]}"
-        )
-    return _strip_whisper_artifacts(completed.stdout)
-
-
-def _strip_whisper_artifacts(text: str) -> str:
-    """whisper-cli prefixes output with the language tag (e.g. ``[it]``)
-    and may include leading/trailing blank lines. Clean both."""
-    lines = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        # Language tag at start: [xx] some text → some text
-        if stripped.startswith("[") and "]" in stripped:
-            close = stripped.index("]")
-            tag = stripped[1:close]
-            if len(tag) <= 4 and tag.isalpha():
-                stripped = stripped[close + 1:].strip()
-        lines.append(stripped)
-    return "\n".join(l for l in lines if l)
-
-
-def _call_gemini(file_path: Path, api_key: str, language: str | None) -> str:
+def _call_audio_llm(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    file_path: Path,
+    language: str | None,
+) -> str:
+    """POST a multimodal `/chat/completions` request to an OpenAI-compatible
+    endpoint with the audio inline-encoded. Returns the transcript text.
+    """
     import httpx
 
     audio_data = base64.b64encode(file_path.read_bytes()).decode()
@@ -279,7 +232,7 @@ def _call_gemini(file_path: Path, api_key: str, language: str | None) -> str:
         prompt += f" The audio is in {language}."
 
     payload = {
-        "model": _GEMINI_MODEL,
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -292,16 +245,16 @@ def _call_gemini(file_path: Path, api_key: str, language: str | None) -> str:
         "max_tokens": 512,
         "temperature": 0,
     }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    url = f"{base_url.rstrip('/')}/chat/completions"
 
     for attempt in range(_EMPTY_RETRIES + 1):
-        response = httpx.post(_OPENROUTER_URL, headers=headers, json=payload, timeout=120)
+        response = httpx.post(url, headers=headers, json=payload, timeout=120)
         if response.status_code != 200:
             raise RuntimeError(
-                f"Gemini API error ({response.status_code}): {response.text[:500]}"
+                f"audio API error ({response.status_code}): {response.text[:500]}"
             )
         result = response.json()
         choices = result.get("choices", [])

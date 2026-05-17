@@ -11,7 +11,10 @@ mcp = FastMCP("kiso-transcriber")
 
 @mcp.tool()
 def transcribe_audio(file_path: str, language: str | None = None) -> dict:
-    """Transcribe an audio file to text via Gemini multimodal (OpenRouter).
+    """Transcribe an audio file to text via a cloud audio LLM.
+
+    Backend is selected by ``KISO_TRANSCRIBER_BACKEND``: ``openrouter``
+    (default) or ``litellm``.
 
     Args:
         file_path: Path to the audio file (absolute, or relative to the
@@ -22,10 +25,10 @@ def transcribe_audio(file_path: str, language: str | None = None) -> dict:
 
     Returns:
         ``{"success": bool, "text": str, "duration_sec": float | None,
-           "format": str | None, "truncated": bool, "stderr": str}``.
+           "format": str | None, "truncated": bool, "backend": str, "stderr": str}``.
 
     Max audio length is 5 minutes; longer files should be split first. The
-    file is auto-compressed to OGG Opus 32kbps mono 16kHz before transfer.
+    file is auto-compressed locally to OGG Opus 32kbps mono 16kHz before transfer.
     """
     return transcriber_runner.transcribe_audio(
         file_path=file_path, language=language,
@@ -49,9 +52,9 @@ def audio_info(file_path: str) -> dict:
 
 @mcp.tool()
 def doctor() -> dict:
-    """Check ffmpeg/ffprobe binaries and OpenRouter credentials.
+    """Check ffmpeg/ffprobe binaries and selected backend reachability.
 
-    Returns ``{"healthy": bool, "issues": [str]}``.
+    Returns ``{"healthy": bool, "issues": [str], "backend": str}``.
     """
     return transcriber_runner.check_health()
 
