@@ -254,3 +254,58 @@ The fix is a pluggable backend — Whisper.cpp local default, Gemini opt-in for 
 - Speaker diarization (WhisperX, pyannote). Out of scope for a transcription server; if needed it goes in a separate `kiso-diarization-mcp` plugin.
 - Real-time / streaming transcription. The MCP tool semantics are request/response on a complete file. Real-time scenarios need a different transport (WebSocket, MCP streaming once supported), out of scope here.
 - Translation alongside transcription. Whisper has a translate-to-English mode, but exposing it would clutter the tool surface. Translation is the calling LLM's job after transcription.
+
+---
+
+## v0.3 — Cloud-only (2026-05-16)
+
+**Status**: planned.
+
+**Why this version exists**
+
+`kiso-transcriber-mcp` is a thin, minimal MCP wrapper around a cloud audio-LLM. The only backend choice is `openrouter` (direct OpenRouter calls) vs `litellm` (through the consumer's LiteLLM gateway for cost/PII/residency governance). Same pattern as `kiso-search-mcp` v0.2 and `kiso-ocr-mcp` v0.3.
+
+Local-STT engines are explicitly out of scope. Air-gapped consumers should fork and add a local backend themselves. ffmpeg stays as a local utility for OGG Opus compression before upload (minimises egress size).
+
+**Design shifts from v0.2**
+
+- **whisper.cpp removed entirely.** No backend selector value `whisper-cpp`. No `whisper-cli` binary dependency. No ggml model handling. No `KISO_TRANSCRIBER_WHISPER_MODEL_PATH`. No `KISO_TRANSCRIBER_WHISPER_BIN`. No whisper.cpp-specific tests.
+- **Backend selector reduced** from `whisper-cpp|gemini` to `openrouter|litellm` — same env-var name `KISO_TRANSCRIBER_BACKEND`, new value space. Default `openrouter` (matches v0.1 and the kiso family).
+- **Single code path internally**: both backends are HTTP POST to an OpenAI-compatible `/chat/completions` (or `/audio/transcriptions` if the route prefers it; consumer-configurable) with the compressed audio file. The selector only switches the base URL (and auth header). One `_call_audio_llm(base_url, api_key, model, audio_bytes)` function.
+- **ffmpeg dependency stays.** Audio compression to OGG Opus 32kbps mono 16kHz is still done locally before upload — it dramatically reduces egress size and is a meaningful cost optimisation independent of which cloud endpoint receives the audio. ffmpeg is a small, ubiquitous dep (apt/brew one-liner) and earns its place.
+- **Tools unchanged**: `transcribe_audio`, `audio_info`, `doctor`. Argument signatures and return shapes stay backwards-compatible.
+- **`doctor` simplified**: drops the whisper-cli/ggml-model check; verifies only ffmpeg presence (still needed) and that the selected backend's env vars are set and the endpoint responds.
+
+**Tasks** (TDD: tests first, then strip, then green)
+
+- [ ] Update `tests/test_transcriber_runner.py`: drop all whisper.cpp-backend assertions; add tests for `KISO_TRANSCRIBER_BACKEND=litellm` route (mocked HTTP to `LITELLM_BASE_URL`); keep ffmpeg-compression tests (with `ffmpeg`/`ffprobe` mocked via fixtures already in use)
+- [ ] Update `tests/test_server.py`: drop whisper-related tool-arg validation; verify `doctor` no longer probes for `whisper-cli` or ggml model file existence
+- [ ] Run pytest — confirm red
+- [ ] Refactor `src/kiso_transcriber_mcp/transcriber_runner.py`: extract `_call_audio_llm(base_url, api_key, model, audio_bytes)`; backend selector resolves `(base_url, api_key, model)` from env once at startup
+- [ ] Strip whisper.cpp code from `transcriber_runner.py` (subprocess wrapper, ggml model loading, the `KISO_TRANSCRIBER_WHISPER_*` env-var pair)
+- [ ] Refactor `src/kiso_transcriber_mcp/server.py`: drop the whisper-cpp `doctor` branch; simplify backend setup
+- [ ] Update `pyproject.toml`: bump `version = "0.3.0"`; update `description` to "Minimal MCP wrapper around a cloud audio-LLM (OpenRouter direct, or via a consumer's LiteLLM gateway), with local ffmpeg compression to minimise egress"
+- [ ] `uv lock` — refresh `uv.lock`
+- [ ] Run pytest — confirm green
+- [ ] Rewrite `README.md` end-to-end: drop whisper.cpp sections, drop ggml model download instructions, drop `KISO_TRANSCRIBER_WHISPER_*` env vars; explain the `openrouter` vs `litellm` selector; keep ffmpeg section (still required)
+- [ ] Append note to `Out of scope for v0.3`: explicit "no local STT path — by design"
+- [ ] Cut `v0.3.0` tag on GitHub *(user action)*
+
+**Exit gate**
+
+- `kiso-transcriber-mcp` v0.3.0 ships with **zero local-compute fallback for transcription**: no whisper.cpp code, no whisper binary check, no ggml model handling, no whisper docs, no whisper tests. ffmpeg stays as the only system dep (and is a local utility, not "local compute" in the model-execution sense).
+- Both `openrouter` and `litellm` backends round-trip a real audio fixture successfully (live test).
+- `doctor` validates ffmpeg presence + selected backend reachability.
+- README explains the cloud-only stance and the migration from v0.2.
+- Cerase (downstream) can update `architecture.md` to reflect "kiso-transcriber-mcp is cloud-only" without an asterisk.
+
+**Effort estimate**: 1–2 days. v0.3 is materially smaller than v0.2; most of the work is deletion. The new tests for the `litellm` route are a straight clone of the `openrouter` tests with a different base URL.
+
+---
+
+## Out of scope for v0.3
+
+- **Local STT engines of any kind.** whisper.cpp, faster-whisper, vosk — out by design. If a consumer needs air-gapped transcription, they fork v0.2 or wire their own MCP server with a local backend; kiso-transcriber-mcp's mission narrows to "minimal cloud audio wrapper".
+- **Provider auto-failover** between OpenRouter and direct provider routes. One backend at a time, set via env. The consumer's LiteLLM gateway already does this — that's exactly why the `litellm` backend exists.
+- **Model selection per tool call.** The model is set once at startup (env var). Per-call model overrides via tool arg are out of scope until a consumer asks.
+- **Diarization, real-time streaming, translation.** Same as v0.2 — these belong elsewhere or to the calling LLM.
